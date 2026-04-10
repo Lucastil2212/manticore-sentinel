@@ -14,6 +14,7 @@ use nix::{
     unistd::Pid,
 };
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 
 use crate::security::audit::{append_event, now_ts, AuditEvent};
 
@@ -99,6 +100,7 @@ impl HelperRuntime {
             .env("MANTICORE_HELPER_AUDIT", &audit_path)
             .env("MANTICORE_HELPER_CAPS", caps)
             .spawn()?;
+        info!(socket = %socket_path.display(), "helper subprocess spawned");
 
         wait_for_startup(&socket_path)?;
         let health = send_request(
@@ -110,8 +112,10 @@ impl HelperRuntime {
             },
         )?;
         if !health.ok {
+            error!(message = %health.message, "helper healthcheck failed");
             return Err(anyhow::anyhow!("helper healthcheck failed: {}", health.message));
         }
+        info!("helper subprocess healthcheck passed");
 
         Ok(Self {
             socket_path,
@@ -161,6 +165,7 @@ fn write_response(stream: &mut UnixStream, response: &HelperResponse) -> anyhow:
 }
 
 fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capability>) {
+    info!(socket = ?listener.local_addr().ok(), "helper service loop started");
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -169,6 +174,7 @@ fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capabili
         let request = read_request(&mut stream);
         let response = match request {
             Ok(req) => {
+                debug!(action = %req.action, pid = req.pid, "helper request received");
                 let resp = handle_request(&req, &capabilities);
                 let _ = append_event(
                     &audit_path,
@@ -191,6 +197,9 @@ fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capabili
                 message: format!("invalid request: {err}"),
             },
         };
+        if !response.ok {
+            warn!(message = %response.message, "helper request denied");
+        }
         let _ = write_response(&mut stream, &response);
     }
 }

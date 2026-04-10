@@ -1,0 +1,48 @@
+name: packaging-validation
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  appimage-scaffold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Build AppImage scaffold
+        run: ./scripts/build-appimage.sh
+
+      - name: Validate AppDir outputs
+        run: |
+          test -f dist/AppDir/usr/bin/manticore-sentinel
+          test -f dist/AppDir/manticore-sentinel.desktop
+          test -f dist/AppDir/AppRun
+
+  flatpak-manifest-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate manifest file exists
+        run: test -f packaging/flatpak/io.manticore.Sentinel.yml
+
+      - name: Validate manifest key fields
+        run: |
+          rg "^app-id: io\\.manticore\\.Sentinel$" packaging/flatpak/io.manticore.Sentinel.yml
+          rg "^runtime:" packaging/flatpak/io.manticore.Sentinel.yml
+          rg "^sdk:" packaging/flatpak/io.manticore.Sentinel.yml
+          rg "^modules:" packaging/flatpak/io.manticore.Sentinel.yml

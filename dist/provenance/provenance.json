@@ -1,0 +1,12 @@
+{
+  "subject": "manticore-sentinel",
+  "commit": "10b102b77bc6972c019160f8dc05975999507345",
+  "generated_at_utc": "2026-04-10T16:01:28Z",
+  "builder": "local-or-ci",
+  "build_commands": [
+    "cargo check",
+    "cargo test",
+    "cargo run -- --benchmark"
+  ],
+  "note": "Scaffold provenance statement; replace with signed attestations in production."
+}

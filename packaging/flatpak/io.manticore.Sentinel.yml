@@ -1,0 +1,22 @@
+app-id: io.manticore.Sentinel
+runtime: org.freedesktop.Platform
+runtime-version: "23.08"
+sdk: org.freedesktop.Sdk
+command: manticore-sentinel
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --filesystem=host-os:ro
+  - --filesystem=/proc:ro
+  - --filesystem=/sys:ro
+modules:
+  - name: manticore-sentinel
+    buildsystem: simple
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/manticore-sentinel /app/bin/manticore-sentinel
+    sources:
+      - type: dir
+        path: ../../

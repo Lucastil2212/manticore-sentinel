@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Manticore Sentinel
+Exec=manticore-sentinel
+Icon=manticore-sentinel
+Type=Application
+Categories=System;Monitor;

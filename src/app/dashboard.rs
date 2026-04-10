@@ -5,12 +5,15 @@ use tokio::runtime::Runtime;
 
 use crate::core::{
     command::{parse_command, CommandAction},
+    config::load_runtime_config,
     engine::SentinelEngine,
+    error::classify_action_error,
     policy::ExecutionPolicy,
     snapshot::SystemSnapshot,
 };
 use crate::security::audit::{append_event, default_audit_path, now_ts, read_recent, AuditEvent};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
+use tracing::{error, info, warn};
 
 pub struct SentinelDashboard {
     engine: SentinelEngine,
@@ -29,6 +32,7 @@ pub struct SentinelDashboard {
     last_audit_refresh: Instant,
     policy: ExecutionPolicy,
     show_onboarding: bool,
+    runtime_diagnostics: String,
 }
 
 impl SentinelDashboard {
@@ -53,6 +57,14 @@ impl SentinelDashboard {
         } else {
             HelperRuntime::start_embedded(socket_path, audit_path, capabilities)?
         };
+        let runtime_diagnostics = load_runtime_config()
+            .map(|cfg| {
+                format!(
+                    "profile={} privileged={} helper_mode={} refresh_ms={}",
+                    cfg.profile, cfg.privileged, cfg.helper_mode, cfg.refresh_ms
+                )
+            })
+            .unwrap_or_else(|err| format!("config_error={err}"));
 
         Ok(Self {
             engine: SentinelEngine::new(),
@@ -71,6 +83,7 @@ impl SentinelDashboard {
             last_audit_refresh: Instant::now() - Duration::from_secs(2),
             policy: ExecutionPolicy::new(allow_privileged),
             show_onboarding: true,
+            runtime_diagnostics,
         })
     }
 
@@ -87,6 +100,7 @@ impl SentinelDashboard {
             }
             Err(err) => {
                 self.last_error = Some(err.to_string());
+                error!(category = "collector", message = %err, "snapshot collection failed");
             }
         }
     }
@@ -110,6 +124,8 @@ impl eframe::App for SentinelDashboard {
                 ui.label(format!("Trust: {}", self.trust_state));
                 ui.separator();
                 ui.label("Audit: APPEND-ONLY");
+                ui.separator();
+                ui.label(format!("Diag: {}", self.runtime_diagnostics));
                 ui.separator();
                 if ui.button("Security Guide").clicked() {
                     self.show_onboarding = true;
@@ -206,6 +222,12 @@ impl eframe::App for SentinelDashboard {
                     });
                 }
                 if let Some(msg) = &self.command_feedback {
+                    let cat = classify_action_error(msg);
+                    if msg.starts_with("DENIED") || msg.starts_with("Invalid") || msg.contains("denied") {
+                        warn!(category = cat.as_str(), message = %msg, "command feedback");
+                    } else {
+                        info!(category = cat.as_str(), message = %msg, "command feedback");
+                    }
                     ui.monospace(msg);
                 }
             });
