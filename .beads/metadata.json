@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "manticore_sentinel",
+  "project_id": "c178500b-c26e-4372-8a83-afb146d5a979"
+}
