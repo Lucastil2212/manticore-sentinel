@@ -12,6 +12,7 @@ use crate::core::{
     snapshot::SystemSnapshot,
 };
 use crate::security::audit::{append_event, default_audit_path, now_ts, read_recent, AuditEvent};
+use crate::security::auth::{AuthContext, AuthGate, AuthMode};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
 use tracing::{error, info, warn};
 
@@ -22,24 +23,29 @@ pub struct SentinelDashboard {
     last_poll: Instant,
     last_error: Option<String>,
     command_input: String,
+    auth_token_input: String,
     command_feedback: Option<String>,
     helper: HelperRuntime,
     trust_state: &'static str,
+    role_label: &'static str,
+    auth_mode_label: &'static str,
     audit_feed: Vec<AuditEvent>,
     visuals_applied: bool,
     pending_action: Option<CommandAction>,
     confirm_input: String,
     last_audit_refresh: Instant,
     policy: ExecutionPolicy,
+    auth_gate: AuthGate,
+    auth_failures: u32,
+    auth_locked_until: Option<Instant>,
     show_onboarding: bool,
     runtime_diagnostics: String,
 }
 
 impl SentinelDashboard {
     pub fn new() -> anyhow::Result<Self> {
-        let allow_privileged = std::env::var("MANTICORE_PRIVILEGED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let cfg = load_runtime_config()?;
+        let allow_privileged = cfg.privileged;
         let mut capabilities = Vec::new();
         let trust_state = if allow_privileged {
             capabilities.push(Capability::KillProcess);
@@ -51,20 +57,27 @@ impl SentinelDashboard {
         let cwd = std::env::current_dir()?;
         let audit_path = default_audit_path(&cwd);
         let socket_path = std::env::temp_dir().join(format!("manticore-sentinel-{}.sock", std::process::id()));
-        let helper_mode = std::env::var("MANTICORE_HELPER_MODE").unwrap_or_else(|_| "embedded".to_string());
+        let helper_mode = cfg.helper_mode.clone();
         let helper = if helper_mode.eq_ignore_ascii_case("subprocess") {
             HelperRuntime::start_subprocess(socket_path, audit_path, capabilities)?
         } else {
             HelperRuntime::start_embedded(socket_path, audit_path, capabilities)?
         };
-        let runtime_diagnostics = load_runtime_config()
-            .map(|cfg| {
-                format!(
-                    "profile={} privileged={} helper_mode={} refresh_ms={}",
-                    cfg.profile, cfg.privileged, cfg.helper_mode, cfg.refresh_ms
-                )
-            })
-            .unwrap_or_else(|err| format!("config_error={err}"));
+        let auth = AuthContext {
+            mode: cfg.auth_mode,
+            role: cfg.role,
+        };
+        let auth_gate = AuthGate::new(auth, cfg.auth_token.clone(), cfg.token_lifecycle);
+        let runtime_diagnostics = format!(
+            "profile={} privileged={} helper_mode={} refresh_ms={} role={} auth_mode={} token_ttl_secs={}",
+            cfg.profile,
+            cfg.privileged,
+            cfg.helper_mode,
+            cfg.refresh_ms,
+            cfg.role.as_str(),
+            cfg.auth_mode.as_str(),
+            cfg.token_lifecycle.map(|t| t.ttl_secs).unwrap_or(0)
+        );
 
         Ok(Self {
             engine: SentinelEngine::new(),
@@ -73,15 +86,21 @@ impl SentinelDashboard {
             last_poll: Instant::now() - Duration::from_millis(500),
             last_error: None,
             command_input: String::new(),
+            auth_token_input: String::new(),
             command_feedback: None,
             helper,
             trust_state,
+            role_label: cfg.role.as_str(),
+            auth_mode_label: cfg.auth_mode.as_str(),
             audit_feed: Vec::new(),
             visuals_applied: false,
             pending_action: None,
             confirm_input: String::new(),
             last_audit_refresh: Instant::now() - Duration::from_secs(2),
-            policy: ExecutionPolicy::new(allow_privileged),
+            policy: ExecutionPolicy::new(auth),
+            auth_gate,
+            auth_failures: 0,
+            auth_locked_until: None,
             show_onboarding: true,
             runtime_diagnostics,
         })
@@ -104,6 +123,37 @@ impl SentinelDashboard {
             }
         }
     }
+
+    fn verify_auth_submission(&mut self, action: &CommandAction) -> Result<(), String> {
+        if let Some(until) = self.auth_locked_until {
+            if Instant::now() < until {
+                let remaining = until.saturating_duration_since(Instant::now()).as_secs();
+                let reason = format!("authentication locked: retry in {}s", remaining.max(1));
+                audit_auth_failure(&self.helper, action, &reason);
+                return Err(reason);
+            }
+            self.auth_locked_until = None;
+        }
+
+        match self
+            .auth_gate
+            .verify_submission(Some(self.auth_token_input.as_str()))
+        {
+            Ok(()) => {
+                self.auth_failures = 0;
+                Ok(())
+            }
+            Err(err) => {
+                self.auth_failures = self.auth_failures.saturating_add(1);
+                if self.auth_failures >= 3 {
+                    let lock_secs = ((self.auth_failures - 2) * 10).min(60) as u64;
+                    self.auth_locked_until = Some(Instant::now() + Duration::from_secs(lock_secs));
+                }
+                audit_auth_failure(&self.helper, action, &err);
+                Err(err)
+            }
+        }
+    }
 }
 
 impl eframe::App for SentinelDashboard {
@@ -122,6 +172,10 @@ impl eframe::App for SentinelDashboard {
                 ui.label("Mode: OPERATOR");
                 ui.separator();
                 ui.label(format!("Trust: {}", self.trust_state));
+                ui.separator();
+                ui.label(format!("Role: {}", self.role_label));
+                ui.separator();
+                ui.label(format!("Auth: {}", self.auth_mode_label));
                 ui.separator();
                 ui.label("Audit: APPEND-ONLY");
                 ui.separator();
@@ -161,13 +215,25 @@ impl eframe::App for SentinelDashboard {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.group(|ui| {
                 ui.label("Command Palette (capability-gated)");
+                if self.auth_gate.context().mode == AuthMode::Token {
+                    ui.horizontal(|ui| {
+                        ui.label("Auth Token");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.auth_token_input)
+                                .password(true)
+                                .hint_text("required in token auth mode"),
+                        );
+                    });
+                }
                 ui.horizontal(|ui| {
                     let response = ui.text_edit_singleline(&mut self.command_input);
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Execute").clicked() || enter {
                         self.command_feedback = Some(match parse_command(&self.command_input) {
                             Ok(action) => {
-                                if matches!(action, CommandAction::KillProcess { .. }) {
+                                if let Err(err) = self.verify_auth_submission(&action) {
+                                    err
+                                } else if matches!(action, CommandAction::KillProcess { .. }) {
                                     if let Err(err) = self.policy.evaluate(&action) {
                                         err
                                     } else {
@@ -200,13 +266,16 @@ impl eframe::App for SentinelDashboard {
                         if ui.button("Confirm").clicked() {
                             if self.confirm_input.trim() == required {
                                 let action = CommandAction::KillProcess { pid };
-                                self.command_feedback = Some(match self.policy.evaluate(&action) {
-                                    Ok(()) => {
-                                        let output = execute_action(&self.helper, action.clone());
-                                        self.policy.record(&action);
-                                        output
-                                    }
+                                self.command_feedback = Some(match self.verify_auth_submission(&action) {
                                     Err(err) => err,
+                                    Ok(()) => match self.policy.evaluate(&action) {
+                                        Ok(()) => {
+                                            let output = execute_action(&self.helper, action.clone());
+                                            self.policy.record(&action);
+                                            output
+                                        }
+                                        Err(err) => err,
+                                    },
                                 });
                                 self.pending_action = None;
                                 self.confirm_input.clear();
@@ -353,6 +422,24 @@ impl eframe::App for SentinelDashboard {
             }
         });
     }
+}
+
+fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &str) {
+    let (action_name, target) = match action {
+        CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
+        CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
+        CommandAction::ReniceProcess { pid, .. } => ("renice_process", format!("pid:{pid}")),
+    };
+    let _ = append_event(
+        &helper.audit_path,
+        &AuditEvent {
+            ts: now_ts(),
+            action: action_name.to_string(),
+            target,
+            result: format!("denied: auth_gate: {reason}"),
+            actor: "operator".to_string(),
+        },
+    );
 }
 
 fn execute_action(helper: &HelperRuntime, action: CommandAction) -> String {
