@@ -28,6 +28,7 @@ This document defines the runtime authorization model for operator actions.
 - Authentication denials (missing, invalid, or expired token) are also appended to audit events.
 - Repeated auth failures trigger temporary lockout backoff (starting at 10s, capped at 60s).
 - The operator command UI shows auth readiness, failure count, and active lockout countdown.
+- In-app Help Center and hover tooltips provide command, navigation, and safety guidance without external docs.
 
 ## Runtime Configuration
 

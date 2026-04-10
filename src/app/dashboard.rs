@@ -39,6 +39,7 @@ pub struct SentinelDashboard {
     auth_failures: u32,
     auth_locked_until: Option<Instant>,
     show_onboarding: bool,
+    show_help_center: bool,
     runtime_diagnostics: String,
 }
 
@@ -102,6 +103,7 @@ impl SentinelDashboard {
             auth_failures: 0,
             auth_locked_until: None,
             show_onboarding: true,
+            show_help_center: false,
             runtime_diagnostics,
         })
     }
@@ -181,8 +183,19 @@ impl eframe::App for SentinelDashboard {
                 ui.separator();
                 ui.label(format!("Diag: {}", self.runtime_diagnostics));
                 ui.separator();
-                if ui.button("Security Guide").clicked() {
+                if ui
+                    .button("Security Guide")
+                    .on_hover_text("Open security posture and destructive-action guidance.")
+                    .clicked()
+                {
                     self.show_onboarding = true;
+                }
+                if ui
+                    .button("Help Center")
+                    .on_hover_text("Open full in-app navigation and command help.")
+                    .clicked()
+                {
+                    self.show_help_center = true;
                 }
             });
         });
@@ -211,10 +224,46 @@ impl eframe::App for SentinelDashboard {
                     }
                 });
         }
+        if self.show_help_center {
+            egui::Window::new("Help Center")
+                .collapsible(true)
+                .resizable(true)
+                .default_size(egui::vec2(560.0, 460.0))
+                .show(ctx, |ui| {
+                    ui.heading("Quick Start");
+                    ui.monospace("1) Check top bar for Trust, Role, and Auth mode.");
+                    ui.monospace("2) Watch CPU/Memory cards for live system health.");
+                    ui.monospace("3) Review Disk/Network throughput severity badges.");
+                    ui.monospace("4) Use Command Palette for safe actions.");
+                    ui.monospace("5) Read Recent Audit Events to verify outcomes.");
+                    ui.separator();
+                    ui.heading("Command Examples");
+                    ui.monospace("show cpu");
+                    ui.monospace("renice 5 1234");
+                    ui.monospace("kill 1234  (requires confirmation and policy permission)");
+                    ui.separator();
+                    ui.heading("Safety Model");
+                    ui.monospace("- Policy gate checks role permissions before execution.");
+                    ui.monospace("- Token mode requires valid token, expiry window, and lockout rules.");
+                    ui.monospace("- Destructive actions are routed through helper boundary.");
+                    ui.monospace("- All accepts/denials are append-only audited.");
+                    ui.separator();
+                    ui.heading("Troubleshooting");
+                    ui.monospace("- DENIED policy: adjust role/mode or command type.");
+                    ui.monospace("- Auth failed: verify token and lockout countdown.");
+                    ui.monospace("- Collector error: verify runtime permissions/profile.");
+                    if ui.button("Close Help").on_hover_text("Close help window.").clicked() {
+                        self.show_help_center = false;
+                    }
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.group(|ui| {
-                ui.label("Command Palette (capability-gated)");
+                ui.label("Command Palette (capability-gated)")
+                    .on_hover_text("Enter approved commands only. Parsing blocks shell operators.");
+                ui.label("Allowed: show cpu | renice <nice> <pid> | kill <pid>")
+                    .on_hover_text("Kill actions require typed confirmation and policy authorization.");
                 if self.auth_gate.context().mode == AuthMode::Token {
                     let lock_remaining = self
                         .auth_locked_until
@@ -243,7 +292,8 @@ impl eframe::App for SentinelDashboard {
                         );
                     }
                     ui.horizontal(|ui| {
-                        ui.label("Auth Token");
+                        ui.label("Auth Token")
+                            .on_hover_text("Required in token mode. Input is masked.");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.auth_token_input)
                                 .password(true)
@@ -254,7 +304,13 @@ impl eframe::App for SentinelDashboard {
                 ui.horizontal(|ui| {
                     let response = ui.text_edit_singleline(&mut self.command_input);
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Execute").clicked() || enter {
+                    response.on_hover_text("Type one command at a time.");
+                    if ui
+                        .button("Execute")
+                        .on_hover_text("Validate, authorize, and execute command.")
+                        .clicked()
+                        || enter
+                    {
                         self.command_feedback = Some(match parse_command(&self.command_input) {
                             Ok(action) => {
                                 if let Err(err) = self.verify_auth_submission(&action) {
@@ -289,7 +345,11 @@ impl eframe::App for SentinelDashboard {
                     );
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.confirm_input);
-                        if ui.button("Confirm").clicked() {
+                        if ui
+                            .button("Confirm")
+                            .on_hover_text("Execute confirmed kill action if policy/auth pass.")
+                            .clicked()
+                        {
                             if self.confirm_input.trim() == required {
                                 let action = CommandAction::KillProcess { pid };
                                 self.command_feedback = Some(match self.verify_auth_submission(&action) {
@@ -309,7 +369,11 @@ impl eframe::App for SentinelDashboard {
                                 self.command_feedback = Some("Confirmation mismatch.".to_string());
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui
+                            .button("Cancel")
+                            .on_hover_text("Clear pending destructive action.")
+                            .clicked()
+                        {
                             self.pending_action = None;
                             self.confirm_input.clear();
                             self.command_feedback = Some("Action canceled.".to_string());
@@ -337,16 +401,19 @@ impl eframe::App for SentinelDashboard {
                 Some(snapshot) => {
                     ui.horizontal(|ui| {
                         ui.group(|ui| {
-                            ui.label("CPU");
+                            ui.label("CPU")
+                                .on_hover_text("Current aggregate processor utilization and load.");
                             ui.heading(format!("{:.2}%", snapshot.cpu.usage_percent));
                             ui.label(format!(
                                 "load {:.2} {:.2} {:.2}",
                                 snapshot.cpu.load_avg.0, snapshot.cpu.load_avg.1, snapshot.cpu.load_avg.2
-                            ));
+                            ))
+                            .on_hover_text("Load averages for 1, 5, and 15 minute windows.");
                         });
 
                         ui.group(|ui| {
-                            ui.label("Memory");
+                            ui.label("Memory")
+                                .on_hover_text("Resident memory usage versus total detected memory.");
                             ui.heading(format!(
                                 "{} / {}",
                                 human_bytes(snapshot.memory.used),
@@ -363,7 +430,8 @@ impl eframe::App for SentinelDashboard {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.group(|ui| {
-                            ui.label("Disk Throughput");
+                            ui.label("Disk Throughput")
+                                .on_hover_text("Per-device read/write rates with severity bands.");
                             for disk in snapshot.disks.iter().take(6) {
                                 let total = disk
                                     .read_bytes_per_sec
@@ -384,7 +452,8 @@ impl eframe::App for SentinelDashboard {
                             }
                         });
                         ui.group(|ui| {
-                            ui.label("Network Throughput");
+                            ui.label("Network Throughput")
+                                .on_hover_text("Per-interface receive/transmit rates and severity.");
                             for net in snapshot.network.iter().take(6) {
                                 let total = net
                                     .rx_bytes_per_sec
@@ -407,7 +476,8 @@ impl eframe::App for SentinelDashboard {
                     });
 
                     ui.separator();
-                    ui.heading("Top Processes (CPU)");
+                    ui.heading("Top Processes (CPU)")
+                        .on_hover_text("Highest CPU consumers in current snapshot.");
                     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                         egui::Grid::new("proc_grid").striped(true).show(ui, |ui| {
                             ui.strong("PID");
@@ -428,7 +498,8 @@ impl eframe::App for SentinelDashboard {
                         });
                     });
                     ui.separator();
-                    ui.heading("Recent Audit Events");
+                    ui.heading("Recent Audit Events")
+                        .on_hover_text("Append-only trail for helper and auth-gate outcomes.");
                     if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
                         self.audit_feed = read_recent(&self.helper.audit_path, 12).unwrap_or_default();
                         self.last_audit_refresh = Instant::now();
