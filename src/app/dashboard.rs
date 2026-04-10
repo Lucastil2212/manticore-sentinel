@@ -6,10 +6,11 @@ use tokio::runtime::Runtime;
 use crate::core::{
     command::{parse_command, CommandAction},
     engine::SentinelEngine,
+    policy::ExecutionPolicy,
     snapshot::SystemSnapshot,
 };
 use crate::security::audit::{append_event, default_audit_path, now_ts, read_recent, AuditEvent};
-use crate::security::helper::{send_request, Capability, HelperRequest, HelperServer};
+use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
 
 pub struct SentinelDashboard {
     engine: SentinelEngine,
@@ -19,13 +20,15 @@ pub struct SentinelDashboard {
     last_error: Option<String>,
     command_input: String,
     command_feedback: Option<String>,
-    helper_server: HelperServer,
+    helper: HelperRuntime,
     trust_state: &'static str,
     audit_feed: Vec<AuditEvent>,
     visuals_applied: bool,
     pending_action: Option<CommandAction>,
     confirm_input: String,
     last_audit_refresh: Instant,
+    policy: ExecutionPolicy,
+    show_onboarding: bool,
 }
 
 impl SentinelDashboard {
@@ -44,7 +47,12 @@ impl SentinelDashboard {
         let cwd = std::env::current_dir()?;
         let audit_path = default_audit_path(&cwd);
         let socket_path = std::env::temp_dir().join(format!("manticore-sentinel-{}.sock", std::process::id()));
-        let helper_server = HelperServer::spawn(socket_path, audit_path, capabilities)?;
+        let helper_mode = std::env::var("MANTICORE_HELPER_MODE").unwrap_or_else(|_| "embedded".to_string());
+        let helper = if helper_mode.eq_ignore_ascii_case("subprocess") {
+            HelperRuntime::start_subprocess(socket_path, audit_path, capabilities)?
+        } else {
+            HelperRuntime::start_embedded(socket_path, audit_path, capabilities)?
+        };
 
         Ok(Self {
             engine: SentinelEngine::new(),
@@ -54,13 +62,15 @@ impl SentinelDashboard {
             last_error: None,
             command_input: String::new(),
             command_feedback: None,
-            helper_server,
+            helper,
             trust_state,
             audit_feed: Vec::new(),
             visuals_applied: false,
             pending_action: None,
             confirm_input: String::new(),
             last_audit_refresh: Instant::now() - Duration::from_secs(2),
+            policy: ExecutionPolicy::new(allow_privileged),
+            show_onboarding: true,
         })
     }
 
@@ -100,8 +110,37 @@ impl eframe::App for SentinelDashboard {
                 ui.label(format!("Trust: {}", self.trust_state));
                 ui.separator();
                 ui.label("Audit: APPEND-ONLY");
+                ui.separator();
+                if ui.button("Security Guide").clicked() {
+                    self.show_onboarding = true;
+                }
             });
         });
+
+        if self.show_onboarding {
+            egui::Window::new("Operator Security Guide")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Trust Modes");
+                    ui.monospace("- UNPRIVILEGED: read-only posture, privileged actions denied.");
+                    ui.monospace("- PRIVILEGED: capability-gated kill/renice via helper boundary.");
+                    ui.separator();
+                    ui.label("Destructive Action Flow");
+                    ui.monospace("1) Parse and validate command.");
+                    ui.monospace("2) Enforce policy checks (privilege + cooldown).");
+                    ui.monospace("3) Require typed confirmation for kill actions.");
+                    ui.monospace("4) Execute via helper socket, not shell.");
+                    ui.separator();
+                    ui.label("Audit Semantics");
+                    ui.monospace("- Every helper action is written to append-only JSONL.");
+                    ui.monospace("- Event fields include action, target, result, actor, timestamp.");
+                    ui.separator();
+                    if ui.button("Acknowledge").clicked() {
+                        self.show_onboarding = false;
+                    }
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.group(|ui| {
@@ -113,10 +152,21 @@ impl eframe::App for SentinelDashboard {
                         self.command_feedback = Some(match parse_command(&self.command_input) {
                             Ok(action) => {
                                 if matches!(action, CommandAction::KillProcess { .. }) {
-                                    self.pending_action = Some(action);
-                                    "Confirmation required for destructive action.".to_string()
+                                    if let Err(err) = self.policy.evaluate(&action) {
+                                        err
+                                    } else {
+                                        self.pending_action = Some(action);
+                                        "Confirmation required for destructive action.".to_string()
+                                    }
                                 } else {
-                                    execute_action(&self.helper_server, action)
+                                    match self.policy.evaluate(&action) {
+                                        Ok(()) => {
+                                            let output = execute_action(&self.helper, action.clone());
+                                            self.policy.record(&action);
+                                            output
+                                        }
+                                        Err(err) => err,
+                                    }
                                 }
                             }
                             Err(err) => format!("Invalid: {err}"),
@@ -133,8 +183,15 @@ impl eframe::App for SentinelDashboard {
                         ui.text_edit_singleline(&mut self.confirm_input);
                         if ui.button("Confirm").clicked() {
                             if self.confirm_input.trim() == required {
-                                self.command_feedback =
-                                    Some(execute_action(&self.helper_server, CommandAction::KillProcess { pid }));
+                                let action = CommandAction::KillProcess { pid };
+                                self.command_feedback = Some(match self.policy.evaluate(&action) {
+                                    Ok(()) => {
+                                        let output = execute_action(&self.helper, action.clone());
+                                        self.policy.record(&action);
+                                        output
+                                    }
+                                    Err(err) => err,
+                                });
                                 self.pending_action = None;
                                 self.confirm_input.clear();
                             } else {
@@ -186,6 +243,51 @@ impl eframe::App for SentinelDashboard {
                             ui.add(egui::ProgressBar::new(mem_ratio).show_percentage());
                         });
                     });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.group(|ui| {
+                            ui.label("Disk Throughput");
+                            for disk in snapshot.disks.iter().take(6) {
+                                let total = disk
+                                    .read_bytes_per_sec
+                                    .saturating_add(disk.write_bytes_per_sec);
+                                let sev = throughput_severity(total);
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        severity_color(sev),
+                                        format!("[{}]", sev.label()),
+                                    );
+                                    ui.monospace(format!(
+                                        "{} R:{} W:{}",
+                                        disk.device,
+                                        human_bytes(disk.read_bytes_per_sec),
+                                        human_bytes(disk.write_bytes_per_sec)
+                                    ));
+                                });
+                            }
+                        });
+                        ui.group(|ui| {
+                            ui.label("Network Throughput");
+                            for net in snapshot.network.iter().take(6) {
+                                let total = net
+                                    .rx_bytes_per_sec
+                                    .saturating_add(net.tx_bytes_per_sec);
+                                let sev = throughput_severity(total);
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        severity_color(sev),
+                                        format!("[{}]", sev.label()),
+                                    );
+                                    ui.monospace(format!(
+                                        "{} RX:{} TX:{}",
+                                        net.interface,
+                                        human_bytes(net.rx_bytes_per_sec),
+                                        human_bytes(net.tx_bytes_per_sec)
+                                    ));
+                                });
+                            }
+                        });
+                    });
 
                     ui.separator();
                     ui.heading("Top Processes (CPU)");
@@ -211,7 +313,7 @@ impl eframe::App for SentinelDashboard {
                     ui.separator();
                     ui.heading("Recent Audit Events");
                     if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
-                        self.audit_feed = read_recent(&self.helper_server.audit_path, 12).unwrap_or_default();
+                        self.audit_feed = read_recent(&self.helper.audit_path, 12).unwrap_or_default();
                         self.last_audit_refresh = Instant::now();
                     }
                     egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
@@ -231,11 +333,11 @@ impl eframe::App for SentinelDashboard {
     }
 }
 
-fn execute_action(helper_server: &HelperServer, action: CommandAction) -> String {
+fn execute_action(helper: &HelperRuntime, action: CommandAction) -> String {
     match action {
         CommandAction::ShowCpu => {
             let _ = append_event(
-                &helper_server.audit_path,
+                &helper.audit_path,
                 &AuditEvent {
                     ts: now_ts(),
                     action: "show_cpu".to_string(),
@@ -252,7 +354,7 @@ fn execute_action(helper_server: &HelperServer, action: CommandAction) -> String
                 pid,
                 nice: None,
             };
-            match send_request(&helper_server.socket_path, &req) {
+            match send_request(&helper.socket_path, &req) {
                 Ok(resp) => format!("{}: {}", if resp.ok { "OK" } else { "DENIED" }, resp.message),
                 Err(err) => format!("Helper error: {err}"),
             }
@@ -263,7 +365,7 @@ fn execute_action(helper_server: &HelperServer, action: CommandAction) -> String
                 pid,
                 nice: Some(nice),
             };
-            match send_request(&helper_server.socket_path, &req) {
+            match send_request(&helper.socket_path, &req) {
                 Ok(resp) => format!("{}: {}", if resp.ok { "OK" } else { "DENIED" }, resp.message),
                 Err(err) => format!("Helper error: {err}"),
             }
@@ -300,4 +402,39 @@ fn apply_security_visuals(ctx: &egui::Context) {
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(19, 33, 44);
     visuals.hyperlink_color = egui::Color32::from_rgb(96, 176, 210);
     ctx.set_visuals(visuals);
+}
+
+#[derive(Clone, Copy)]
+enum ThroughputSeverity {
+    Nominal,
+    Elevated,
+    Critical,
+}
+
+impl ThroughputSeverity {
+    fn label(self) -> &'static str {
+        match self {
+            ThroughputSeverity::Nominal => "NOMINAL",
+            ThroughputSeverity::Elevated => "ELEVATED",
+            ThroughputSeverity::Critical => "CRITICAL",
+        }
+    }
+}
+
+fn throughput_severity(bytes_per_sec: u64) -> ThroughputSeverity {
+    if bytes_per_sec >= 100 * 1024 * 1024 {
+        ThroughputSeverity::Critical
+    } else if bytes_per_sec >= 20 * 1024 * 1024 {
+        ThroughputSeverity::Elevated
+    } else {
+        ThroughputSeverity::Nominal
+    }
+}
+
+fn severity_color(severity: ThroughputSeverity) -> egui::Color32 {
+    match severity {
+        ThroughputSeverity::Nominal => egui::Color32::from_rgb(96, 176, 210),
+        ThroughputSeverity::Elevated => egui::Color32::from_rgb(220, 176, 64),
+        ThroughputSeverity::Critical => egui::Color32::from_rgb(208, 72, 64),
+    }
 }

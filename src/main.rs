@@ -6,6 +6,14 @@ mod security;
 mod utils;
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--helper-daemon") {
+        return security::helper::run_helper_daemon_from_env();
+    }
+    if args.iter().any(|arg| arg == "--benchmark") {
+        return run_benchmark_mode();
+    }
+
     let options = eframe::NativeOptions::default();
     let app = app::dashboard::SentinelDashboard::new()?;
 
@@ -15,6 +23,34 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |_cc| Box::new(app)),
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
+
+    Ok(())
+}
+
+fn run_benchmark_mode() -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let mut engine = core::engine::SentinelEngine::new();
+    let runtime = tokio::runtime::Runtime::new()?;
+    let iterations = 40u32;
+
+    let startup_begin = Instant::now();
+    let _first = runtime.block_on(engine.collect())?;
+    let startup_ms = startup_begin.elapsed().as_secs_f64() * 1000.0;
+
+    let mut total_ms = 0.0f64;
+    for _ in 0..iterations {
+        let step = Instant::now();
+        let _ = runtime.block_on(engine.collect())?;
+        total_ms += step.elapsed().as_secs_f64() * 1000.0;
+    }
+    let avg_ms = total_ms / iterations as f64;
+    let hz = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
+
+    println!("benchmark.startup_ms={:.3}", startup_ms);
+    println!("benchmark.collect_avg_ms={:.3}", avg_ms);
+    println!("benchmark.collect_hz={:.3}", hz);
+    println!("benchmark.iterations={}", iterations);
 
     Ok(())
 }

@@ -3,7 +3,9 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
+    process::{Child, Command},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use nix::{
@@ -36,8 +38,14 @@ pub struct HelperResponse {
 
 pub struct HelperServer {
     pub socket_path: PathBuf,
-    pub audit_path: PathBuf,
     _thread: JoinHandle<()>,
+}
+
+pub struct HelperRuntime {
+    pub socket_path: PathBuf,
+    pub audit_path: PathBuf,
+    _embedded: Option<HelperServer>,
+    child: Option<Child>,
 }
 
 impl HelperServer {
@@ -53,44 +61,10 @@ impl HelperServer {
         }
 
         let audit_path_for_thread = audit_path.clone();
-        let thread = thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let request = read_request(&mut stream);
-                let response = match request {
-                    Ok(req) => {
-                        let resp = handle_request(&req, &capabilities);
-                        let _ = append_event(
-                            &audit_path_for_thread,
-                            &AuditEvent {
-                                ts: now_ts(),
-                                action: req.action.clone(),
-                                target: format!("pid:{}", req.pid),
-                                result: if resp.ok {
-                                    format!("ok: {}", resp.message)
-                                } else {
-                                    format!("denied: {}", resp.message)
-                                },
-                                actor: "operator".to_string(),
-                            },
-                        );
-                        resp
-                    }
-                    Err(err) => HelperResponse {
-                        ok: false,
-                        message: format!("invalid request: {err}"),
-                    },
-                };
-                let _ = write_response(&mut stream, &response);
-            }
-        });
+        let thread = thread::spawn(move || serve(listener, audit_path_for_thread, capabilities));
 
         Ok(Self {
             socket_path,
-            audit_path,
             _thread: thread,
         })
     }
@@ -98,6 +72,62 @@ impl HelperServer {
 
 impl Drop for HelperServer {
     fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+impl HelperRuntime {
+    pub fn start_embedded(socket_path: PathBuf, audit_path: PathBuf, capabilities: Vec<Capability>) -> anyhow::Result<Self> {
+        let server = HelperServer::spawn(socket_path.clone(), audit_path.clone(), capabilities)?;
+        Ok(Self {
+            socket_path,
+            audit_path,
+            _embedded: Some(server),
+            child: None,
+        })
+    }
+
+    pub fn start_subprocess(socket_path: PathBuf, audit_path: PathBuf, capabilities: Vec<Capability>) -> anyhow::Result<Self> {
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+        let caps = serialize_capabilities(&capabilities);
+        let exe = std::env::current_exe()?;
+        let child = Command::new(exe)
+            .arg("--helper-daemon")
+            .env("MANTICORE_HELPER_SOCKET", &socket_path)
+            .env("MANTICORE_HELPER_AUDIT", &audit_path)
+            .env("MANTICORE_HELPER_CAPS", caps)
+            .spawn()?;
+
+        wait_for_startup(&socket_path)?;
+        let health = send_request(
+            &socket_path,
+            &HelperRequest {
+                action: "healthcheck".to_string(),
+                pid: 0,
+                nice: None,
+            },
+        )?;
+        if !health.ok {
+            return Err(anyhow::anyhow!("helper healthcheck failed: {}", health.message));
+        }
+
+        Ok(Self {
+            socket_path,
+            audit_path,
+            _embedded: None,
+            child: Some(child),
+        })
+    }
+}
+
+impl Drop for HelperRuntime {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let _ = fs::remove_file(&self.socket_path);
     }
 }
@@ -130,8 +160,44 @@ fn write_response(stream: &mut UnixStream, response: &HelperResponse) -> anyhow:
     Ok(())
 }
 
+fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capability>) {
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let request = read_request(&mut stream);
+        let response = match request {
+            Ok(req) => {
+                let resp = handle_request(&req, &capabilities);
+                let _ = append_event(
+                    &audit_path,
+                    &AuditEvent {
+                        ts: now_ts(),
+                        action: req.action.clone(),
+                        target: format!("pid:{}", req.pid),
+                        result: if resp.ok {
+                            format!("ok: {}", resp.message)
+                        } else {
+                            format!("denied: {}", resp.message)
+                        },
+                        actor: "operator".to_string(),
+                    },
+                );
+                resp
+            }
+            Err(err) => HelperResponse {
+                ok: false,
+                message: format!("invalid request: {err}"),
+            },
+        };
+        let _ = write_response(&mut stream, &response);
+    }
+}
+
 fn handle_request(req: &HelperRequest, caps: &[Capability]) -> HelperResponse {
     match req.action.as_str() {
+        "healthcheck" => allow("ready".to_string()),
         "kill_process" => {
             if !caps.contains(&Capability::KillProcess) {
                 return deny("missing capability KillProcess");
@@ -182,5 +248,183 @@ fn set_priority(pid: u32, nice: i32) -> anyhow::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error().into())
+    }
+}
+
+pub fn run_helper_daemon_from_env() -> anyhow::Result<()> {
+    let socket_path = std::env::var("MANTICORE_HELPER_SOCKET")
+        .map(PathBuf::from)
+        .map_err(|_| anyhow::anyhow!("MANTICORE_HELPER_SOCKET missing"))?;
+    let audit_path = std::env::var("MANTICORE_HELPER_AUDIT")
+        .map(PathBuf::from)
+        .map_err(|_| anyhow::anyhow!("MANTICORE_HELPER_AUDIT missing"))?;
+    let caps_raw = std::env::var("MANTICORE_HELPER_CAPS").unwrap_or_default();
+    let capabilities = parse_capabilities(&caps_raw);
+
+    if socket_path.exists() {
+        let _ = fs::remove_file(&socket_path);
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+    }
+
+    serve(listener, audit_path, capabilities);
+    Ok(())
+}
+
+fn parse_capabilities(raw: &str) -> Vec<Capability> {
+    raw.split(',')
+        .filter_map(|item| match item.trim() {
+            "kill" => Some(Capability::KillProcess),
+            "renice" => Some(Capability::ReniceProcess),
+            _ => None,
+        })
+        .collect()
+}
+
+fn serialize_capabilities(capabilities: &[Capability]) -> String {
+    let mut parts = Vec::new();
+    for cap in capabilities {
+        match cap {
+            Capability::KillProcess => parts.push("kill"),
+            Capability::ReniceProcess => parts.push("renice"),
+        }
+    }
+    parts.join(",")
+}
+
+fn wait_for_startup(socket_path: &Path) -> anyhow::Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if socket_path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(anyhow::anyhow!("helper socket startup timeout"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
+
+    use super::{send_request, Capability, HelperRequest, HelperServer};
+
+    fn unique_path(suffix: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "manticore-helper-test-{}-{}-{}",
+            std::process::id(),
+            suffix,
+            super::now_ts()
+        ));
+        p
+    }
+
+    fn wait_for_socket(path: &PathBuf) {
+        for _ in 0..30 {
+            if path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("socket not ready: {}", path.display());
+    }
+
+    #[test]
+    fn uds_denies_when_capability_missing() {
+        let socket = unique_path("deny.sock");
+        let audit = unique_path("deny.jsonl");
+        let server = HelperServer::spawn(socket.clone(), audit.clone(), vec![]).expect("spawn helper");
+        wait_for_socket(&socket);
+
+        let response = send_request(
+            &socket,
+            &HelperRequest {
+                action: "kill_process".to_string(),
+                pid: 999999,
+                nice: None,
+            },
+        )
+        .expect("send request");
+
+        assert!(!response.ok);
+        assert!(response.message.contains("missing capability"));
+
+        drop(server);
+        let _ = fs::remove_file(audit);
+    }
+
+    #[test]
+    fn uds_rejects_protected_pid() {
+        let socket = unique_path("protected.sock");
+        let audit = unique_path("protected.jsonl");
+        let server = HelperServer::spawn(
+            socket.clone(),
+            audit.clone(),
+            vec![Capability::KillProcess, Capability::ReniceProcess],
+        )
+        .expect("spawn helper");
+        wait_for_socket(&socket);
+
+        let kill_response = send_request(
+            &socket,
+            &HelperRequest {
+                action: "kill_process".to_string(),
+                pid: 1,
+                nice: None,
+            },
+        )
+        .expect("send kill request");
+        assert!(!kill_response.ok);
+        assert!(kill_response.message.contains("protected pid"));
+
+        let renice_response = send_request(
+            &socket,
+            &HelperRequest {
+                action: "renice_process".to_string(),
+                pid: 1,
+                nice: Some(5),
+            },
+        )
+        .expect("send renice request");
+        assert!(!renice_response.ok);
+        assert!(renice_response.message.contains("protected pid"));
+
+        drop(server);
+        let _ = fs::remove_file(audit);
+    }
+
+    #[test]
+    fn uds_kill_success_path() {
+        let socket = unique_path("success.sock");
+        let audit = unique_path("success.jsonl");
+        let server = HelperServer::spawn(socket.clone(), audit.clone(), vec![Capability::KillProcess])
+            .expect("spawn helper");
+        wait_for_socket(&socket);
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep process");
+
+        let response = send_request(
+            &socket,
+            &HelperRequest {
+                action: "kill_process".to_string(),
+                pid: child.id(),
+                nice: None,
+            },
+        )
+        .expect("send request");
+
+        assert!(response.ok, "expected success response, got: {}", response.message);
+        let _ = child.wait();
+
+        drop(server);
+        let _ = fs::remove_file(audit);
     }
 }
