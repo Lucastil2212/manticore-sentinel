@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui_extras::install_image_loaders;
 use tokio::runtime::Runtime;
 
 use crate::core::{
@@ -15,6 +16,13 @@ use crate::security::audit::{append_event, default_audit_path, now_ts, read_rece
 use crate::security::auth::{AuthContext, AuthGate, AuthMode};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
 use tracing::{error, info, warn};
+
+const ICON_MARK: &[u8] = include_bytes!("../../assets/icons/manticore-mark.svg");
+const ICON_SHIELD: &[u8] = include_bytes!("../../assets/icons/icon-shield.svg");
+const ICON_RADAR: &[u8] = include_bytes!("../../assets/icons/icon-radar.svg");
+const ICON_COMMAND: &[u8] = include_bytes!("../../assets/icons/icon-command.svg");
+const ICON_AUDIT: &[u8] = include_bytes!("../../assets/icons/icon-audit.svg");
+const ICON_SETTINGS: &[u8] = include_bytes!("../../assets/icons/icon-settings.svg");
 
 pub struct SentinelDashboard {
     engine: SentinelEngine,
@@ -161,6 +169,7 @@ impl SentinelDashboard {
 impl eframe::App for SentinelDashboard {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.visuals_applied {
+            install_image_loaders(ctx);
             apply_security_visuals(ctx);
             self.visuals_applied = true;
         }
@@ -169,6 +178,7 @@ impl eframe::App for SentinelDashboard {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                icon(ui, "mark", ICON_MARK, 18.0);
                 ui.heading("Manticore Sentinel");
                 ui.separator();
                 ui.label("Mode: OPERATOR");
@@ -260,8 +270,11 @@ impl eframe::App for SentinelDashboard {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.group(|ui| {
-                ui.label("Command Palette (capability-gated)")
-                    .on_hover_text("Enter approved commands only. Parsing blocks shell operators.");
+                ui.horizontal(|ui| {
+                    icon(ui, "command", ICON_COMMAND, 15.0);
+                    ui.label("Command Palette (capability-gated)")
+                        .on_hover_text("Enter approved commands only. Parsing blocks shell operators.");
+                });
                 ui.label("Allowed: show cpu | renice <nice> <pid> | kill <pid>")
                     .on_hover_text("Kill actions require typed confirmation and policy authorization.");
                 if self.auth_gate.context().mode == AuthMode::Token {
@@ -389,6 +402,22 @@ impl eframe::App for SentinelDashboard {
                     }
                     ui.monospace(msg);
                 }
+                egui::CollapsingHeader::new("Advanced Controls")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            icon(ui, "settings", ICON_SETTINGS, 14.0);
+                            ui.label("Power-user diagnostics and runtime metadata");
+                        });
+                        ui.monospace(format!("helper_socket={}", self.helper.socket_path.display()));
+                        ui.monospace(format!("audit_path={}", self.helper.audit_path.display()));
+                        ui.monospace(format!("auth_failures={}", self.auth_failures));
+                        ui.monospace(format!(
+                            "auth_lockout_active={}",
+                            self.auth_locked_until.map(|t| t > Instant::now()).unwrap_or(false)
+                        ));
+                        ui.monospace(format!("runtime={}", self.runtime_diagnostics));
+                    });
             });
             ui.separator();
 
@@ -401,6 +430,7 @@ impl eframe::App for SentinelDashboard {
                 Some(snapshot) => {
                     ui.horizontal(|ui| {
                         ui.group(|ui| {
+                            icon(ui, "radar", ICON_RADAR, 14.0);
                             ui.label("CPU")
                                 .on_hover_text("Current aggregate processor utilization and load.");
                             ui.heading(format!("{:.2}%", snapshot.cpu.usage_percent));
@@ -412,6 +442,7 @@ impl eframe::App for SentinelDashboard {
                         });
 
                         ui.group(|ui| {
+                            icon(ui, "shield", ICON_SHIELD, 14.0);
                             ui.label("Memory")
                                 .on_hover_text("Resident memory usage versus total detected memory.");
                             ui.heading(format!(
@@ -430,6 +461,7 @@ impl eframe::App for SentinelDashboard {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.group(|ui| {
+                            icon(ui, "radar-disk", ICON_RADAR, 14.0);
                             ui.label("Disk Throughput")
                                 .on_hover_text("Per-device read/write rates with severity bands.");
                             for disk in snapshot.disks.iter().take(6) {
@@ -452,6 +484,7 @@ impl eframe::App for SentinelDashboard {
                             }
                         });
                         ui.group(|ui| {
+                            icon(ui, "radar-net", ICON_RADAR, 14.0);
                             ui.label("Network Throughput")
                                 .on_hover_text("Per-interface receive/transmit rates and severity.");
                             for net in snapshot.network.iter().take(6) {
@@ -476,8 +509,11 @@ impl eframe::App for SentinelDashboard {
                     });
 
                     ui.separator();
-                    ui.heading("Top Processes (CPU)")
-                        .on_hover_text("Highest CPU consumers in current snapshot.");
+                    ui.horizontal(|ui| {
+                        icon(ui, "command-process", ICON_COMMAND, 14.0);
+                        ui.heading("Top Processes (CPU)")
+                            .on_hover_text("Highest CPU consumers in current snapshot.");
+                    });
                     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                         egui::Grid::new("proc_grid").striped(true).show(ui, |ui| {
                             ui.strong("PID");
@@ -498,8 +534,11 @@ impl eframe::App for SentinelDashboard {
                         });
                     });
                     ui.separator();
-                    ui.heading("Recent Audit Events")
-                        .on_hover_text("Append-only trail for helper and auth-gate outcomes.");
+                    ui.horizontal(|ui| {
+                        icon(ui, "audit", ICON_AUDIT, 14.0);
+                        ui.heading("Recent Audit Events")
+                            .on_hover_text("Append-only trail for helper and auth-gate outcomes.");
+                    });
                     if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
                         self.audit_feed = read_recent(&self.helper.audit_path, 12).unwrap_or_default();
                         self.last_audit_refresh = Instant::now();
@@ -519,6 +558,12 @@ impl eframe::App for SentinelDashboard {
             }
         });
     }
+}
+
+fn icon(ui: &mut egui::Ui, name: &str, bytes: &'static [u8], size: f32) {
+    let image = egui::Image::from_bytes(format!("bytes://{name}.svg"), bytes)
+        .fit_to_exact_size(egui::vec2(size, size));
+    let _ = ui.add(image);
 }
 
 fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &str) {
