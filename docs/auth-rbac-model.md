@@ -27,6 +27,7 @@ This document defines the runtime authorization model for operator actions.
 - Every accepted or denied helper action is append-only audited in JSONL.
 - Authentication denials (missing, invalid, or expired token) are also appended to audit events.
 - Repeated auth failures trigger temporary lockout backoff (starting at 10s, capped at 60s).
+- The operator command UI shows auth readiness, failure count, and active lockout countdown.
 
 ## Runtime Configuration
 

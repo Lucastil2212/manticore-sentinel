@@ -216,6 +216,32 @@ impl eframe::App for SentinelDashboard {
             ui.group(|ui| {
                 ui.label("Command Palette (capability-gated)");
                 if self.auth_gate.context().mode == AuthMode::Token {
+                    let lock_remaining = self
+                        .auth_locked_until
+                        .and_then(|until| until.checked_duration_since(Instant::now()))
+                        .map(|d| d.as_secs().max(1));
+                    if let Some(remaining) = lock_remaining {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 76, 70),
+                            format!(
+                                "Auth lockout active: {} failures, retry in {}s",
+                                self.auth_failures, remaining
+                            ),
+                        );
+                    } else if self.auth_failures > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 176, 64),
+                            format!(
+                                "Auth failures: {} (lockout after 3 consecutive failures)",
+                                self.auth_failures
+                            ),
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(96, 176, 210),
+                            "Auth status: ready",
+                        );
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Auth Token");
                         ui.add(
