@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{FontFamily, FontId, RichText};
+use egui::{FontFamily, FontId, RichText, Stroke};
 use egui_extras::install_image_loaders;
 use tokio::runtime::Runtime;
 
@@ -9,7 +10,6 @@ use crate::core::{
     command::{parse_command, CommandAction},
     config::load_runtime_config,
     engine::SentinelEngine,
-    error::classify_action_error,
     policy::ExecutionPolicy,
     snapshot::SystemSnapshot,
 };
@@ -17,11 +17,23 @@ use crate::models::process::ProcessMetrics;
 use crate::security::audit::{append_event, default_audit_path, now_ts, read_recent, AuditEvent};
 use crate::security::auth::{AuthContext, AuthGate, AuthMode};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
-use tracing::{error, info, warn};
+use tracing::error;
 
 use super::icons;
 
 const ID_COMMAND_INPUT: &str = "command_palette_input";
+
+fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
+    const ALL: &[&str] = &["show cpu", "renice ", "kill "];
+    let low = typed.trim_start().to_ascii_lowercase();
+    if low.is_empty() {
+        return ALL.to_vec();
+    }
+    ALL.iter()
+        .copied()
+        .filter(|c| c.to_ascii_lowercase().starts_with(&low))
+        .collect()
+}
 
 pub struct SentinelDashboard {
     engine: SentinelEngine,
@@ -50,6 +62,12 @@ pub struct SentinelDashboard {
     runtime_diagnostics: String,
     /// Last command feedback string we pushed as an accessibility `ValueChanged` event.
     last_command_feedback_announced: Option<String>,
+    /// Executed commands (oldest at front, newest at back), max 50.
+    command_history: VecDeque<String>,
+    /// When set, `command_input` shows `command_history[len - 1 - k]` (k = newer toward 0).
+    history_browse: Option<usize>,
+    /// Line being edited before ↑ opened history (restored on ↓ from newest).
+    history_draft: String,
 }
 
 impl SentinelDashboard {
@@ -115,6 +133,9 @@ impl SentinelDashboard {
             show_help_center: false,
             runtime_diagnostics,
             last_command_feedback_announced: None,
+            command_history: VecDeque::new(),
+            history_browse: None,
+            history_draft: String::new(),
         })
     }
 
@@ -195,30 +216,109 @@ impl SentinelDashboard {
     }
 
     fn run_command_palette_action(&mut self) {
-        self.command_feedback = Some(match parse_command(&self.command_input) {
+        let trimmed = self.command_input.trim().to_string();
+        let (feedback, clear_line) = match parse_command(&trimmed) {
             Ok(action) => {
                 if let Err(err) = self.verify_auth_submission(&action) {
-                    err
+                    (err, false)
                 } else if matches!(action, CommandAction::KillProcess { .. }) {
-                    if let Err(err) = self.policy.evaluate(&action) {
-                        err
-                    } else {
-                        self.pending_action = Some(action);
-                        "Confirmation required for destructive action.".to_string()
+                    match self.policy.evaluate(&action) {
+                        Err(err) => (err, false),
+                        Ok(()) => {
+                            self.pending_action = Some(action);
+                            (
+                                "Confirmation required for destructive action.".to_string(),
+                                false,
+                            )
+                        }
                     }
                 } else {
                     match self.policy.evaluate(&action) {
+                        Err(err) => (err, false),
                         Ok(()) => {
                             let output = execute_action(&self.helper, action.clone());
                             self.policy.record(&action);
-                            output
+                            (output, true)
                         }
-                        Err(err) => err,
                     }
                 }
             }
-            Err(err) => format!("Invalid: {err}"),
-        });
+            Err(err) => (format!("Invalid: {err}"), false),
+        };
+
+        if clear_line {
+            self.record_command_history(&trimmed);
+            self.command_input.clear();
+            self.history_browse = None;
+            self.history_draft.clear();
+        }
+        self.command_feedback = Some(feedback);
+    }
+
+    fn record_command_history(&mut self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        if self.command_history.back().map(|s| s.as_str()) == Some(line) {
+            return;
+        }
+        while self.command_history.len() >= 50 {
+            self.command_history.pop_front();
+        }
+        self.command_history.push_back(line.to_string());
+    }
+
+    fn history_entry_from_newest(&self, from_newest: usize) -> Option<&String> {
+        let len = self.command_history.len();
+        let idx = len.checked_sub(1 + from_newest)?;
+        self.command_history.get(idx)
+    }
+
+    fn shell_history_up(&mut self) {
+        let len = self.command_history.len();
+        if len == 0 {
+            return;
+        }
+        match self.history_browse {
+            None => {
+                self.history_draft = self.command_input.clone();
+                self.history_browse = Some(0);
+                if let Some(e) = self.history_entry_from_newest(0) {
+                    self.command_input = e.clone();
+                }
+            }
+            Some(k) if k + 1 < len => {
+                self.history_browse = Some(k + 1);
+                if let Some(e) = self.history_entry_from_newest(k + 1) {
+                    self.command_input = e.clone();
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn shell_history_down(&mut self) {
+        match self.history_browse {
+            None => {}
+            Some(0) => {
+                self.history_browse = None;
+                self.command_input.clone_from(&self.history_draft);
+                self.history_draft.clear();
+            }
+            Some(k) => {
+                self.history_browse = Some(k - 1);
+                if let Some(e) = self.history_entry_from_newest(k - 1) {
+                    self.command_input = e.clone();
+                }
+            }
+        }
+    }
+
+    fn shell_tab_complete(&mut self) {
+        let comps = filtered_command_completions(&self.command_input);
+        if let Some(first) = comps.first() {
+            self.command_input = (*first).to_string();
+        }
     }
 
     fn quick_status_chips(&self, ui: &mut egui::Ui) {
@@ -254,219 +354,443 @@ impl SentinelDashboard {
     }
 
     fn render_command_workbench(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.group(|ui| {
-            let panel_w = ui.available_width();
-            ui.set_min_width(panel_w);
-            ui.horizontal_wrapped(|ui| {
-                icons::paint(ui, "command", icons::COMMAND, 15.0);
-                ui.label("Command Palette (capability-gated)")
-                    .on_hover_text("Enter approved commands only. Parsing blocks shell operators.");
-            });
-            ui.add(
-                egui::Label::new("Allowed: show cpu | renice <nice> <pid> | kill <pid>")
-                    .wrap(true),
-            )
-            .on_hover_text("Kill actions require typed confirmation and policy authorization.");
-            if self.auth_gate.context().mode == AuthMode::Token {
-                let lock_remaining = self
-                    .auth_locked_until
-                    .and_then(|until| until.checked_duration_since(Instant::now()))
-                    .map(|d| d.as_secs().max(1));
-                if let Some(remaining) = lock_remaining {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 76, 70),
-                        format!(
-                            "Auth lockout active: {} failures, retry in {}s",
-                            self.auth_failures, remaining
-                        ),
-                    );
-                } else if self.auth_failures > 0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 176, 64),
-                        format!(
-                            "Auth failures: {} (lockout after 3 consecutive failures)",
-                            self.auth_failures
-                        ),
-                    );
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(96, 176, 210),
-                        "Auth status: ready",
-                    );
-                }
-                ui.vertical(|ui| {
+        let panel_w = ui.available_width();
+        ui.set_min_width(panel_w);
+
+        let shell_inset = egui::Margin::symmetric(12.0, 10.0);
+        let shell_fill = egui::Color32::from_rgb(16, 20, 26);
+        let shell_stroke = Stroke::new(1.0, egui::Color32::from_rgb(52, 66, 84));
+        let mono = FontId::new(16.0, FontFamily::Monospace);
+        let mono_hint = FontId::new(12.0, FontFamily::Monospace);
+        let prompt_color = egui::Color32::from_rgb(110, 198, 224);
+
+        ui.horizontal_wrapped(|ui| {
+            icons::paint(ui, "command", icons::COMMAND, 15.0);
+            ui.label(
+                RichText::new("Operator shell")
+                    .strong()
+                    .font(FontId::new(14.5, FontFamily::Proportional)),
+            );
+        });
+        ui.label(
+            RichText::new("Structured commands only — no pipes, redirects, or subshells.")
+                .weak()
+                .font(FontId::new(12.5, FontFamily::Proportional)),
+        );
+        ui.add_space(6.0);
+
+        if self.auth_gate.context().mode == AuthMode::Token {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(20, 24, 30))
+                .inner_margin(shell_inset)
+                .rounding(egui::Rounding::same(6.0))
+                .stroke(shell_stroke)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let lock_remaining = self
+                        .auth_locked_until
+                        .and_then(|until| until.checked_duration_since(Instant::now()))
+                        .map(|d| d.as_secs().max(1));
+                    if let Some(remaining) = lock_remaining {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 76, 70),
+                            format!(
+                                "Auth lockout active: {} failures, retry in {}s",
+                                self.auth_failures, remaining
+                            ),
+                        );
+                    } else if self.auth_failures > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 176, 64),
+                            format!(
+                                "Auth failures: {} (lockout after 3 consecutive failures)",
+                                self.auth_failures
+                            ),
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(96, 176, 210),
+                            "Auth status: ready",
+                        );
+                    }
+                    ui.add_space(4.0);
                     let tok_lbl = ui
-                        .label("Auth Token")
+                        .label(RichText::new("Token").font(mono_hint.clone()))
                         .on_hover_text("Required in token mode. Input is masked.");
                     let token_w = ui.available_width().max(120.0);
                     let te = egui::TextEdit::singleline(&mut self.auth_token_input)
+                        .font(mono_hint.clone())
                         .password(true)
-                        .hint_text("required in token auth mode")
+                        .hint_text("paste token")
                         .desired_width(token_w);
                     ui.add(te).labelled_by(tok_lbl.id);
                 });
-            }
-            let cmd_row_room = panel_w;
-            if cmd_row_room >= 520.0 {
-                ui.horizontal(|ui| {
-                    let cmd_lbl = ui
-                        .label("Command")
-                        .on_hover_text("Single-line operator command; press Enter or Execute.");
-                    let btn_reserve = 96.0 + ui.spacing().item_spacing.x * 2.0;
-                    let edit_w = (ui.available_width() - btn_reserve).max(160.0);
-                    let response = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.command_input)
-                                .id(egui::Id::new(ID_COMMAND_INPUT))
-                                .desired_width(edit_w)
-                                .hint_text("e.g. show cpu"),
+            ui.add_space(8.0);
+        }
+
+        egui::Frame::none()
+            .fill(shell_fill)
+            .inner_margin(shell_inset)
+            .rounding(egui::Rounding::same(8.0))
+            .stroke(shell_stroke)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    RichText::new("Tab complete · ↑ / ↓ history · Enter run · ⌘K focus")
+                        .weak()
+                        .font(mono_hint.clone()),
+                )
+                .on_hover_text("Same spirit as a modern terminal: keyboard-first, no raw shell.");
+                ui.add_space(6.0);
+
+                let cmd_row_room = ui.available_width();
+                let run_reserve = 76.0 + ui.spacing().item_spacing.x * 2.0;
+                let prompt_reserve = 108.0;
+                let edit_w = (cmd_row_room - run_reserve - prompt_reserve).max(120.0);
+
+                let mut run_clicked = false;
+                let mut enter_run = false;
+                let response = ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("sentinel")
+                            .color(prompt_color)
+                            .font(mono.clone()),
+                    )
+                    .on_hover_text("This session’s operator shell (not a system shell).");
+                    ui.label(RichText::new("›").weak().font(mono.clone()));
+                    let te = egui::TextEdit::singleline(&mut self.command_input)
+                        .id(egui::Id::new(ID_COMMAND_INPUT))
+                        .font(mono.clone())
+                        .hint_text("show cpu")
+                        .desired_width(edit_w);
+                    let r = ui.add(te).on_hover_text(
+                        "Enter runs the line. Tab fills the first matching built-in.",
+                    );
+                    // Single-line TextEdit: Enter must be detected while focused (lost_focus + Enter
+                    // often never align in the same frame).
+                    enter_run = ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) && r.has_focus();
+                    let run = ui
+                        .add_sized(
+                            [68.0, 30.0],
+                            egui::Button::new(RichText::new("Run").strong().font(FontId::new(
+                                13.5,
+                                FontFamily::Proportional,
+                            )))
+                            .fill(egui::Color32::from_rgb(52, 98, 128))
+                            .stroke(Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(72, 118, 148),
+                            )),
                         )
-                        .labelled_by(cmd_lbl.id);
-                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    response.on_hover_text("Type one command at a time.");
-                    let exec = ui
-                        .button("Execute")
-                        .on_hover_text("Validate, authorize, and execute command.");
-                    exec.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, "Execute command"));
-                    if exec.clicked() || enter {
+                        .on_hover_text("Run the current line (same as Enter).");
+                    run.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, "Run command"));
+                    run_clicked = run.clicked();
+                    r
+                });
+
+                if response.inner.has_focus() {
+                    if ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        self.shell_history_up();
+                    }
+                    if ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        self.shell_history_down();
+                    }
+                    if ui.ctx().input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.shift) {
+                        self.shell_tab_complete();
+                    }
+                }
+
+                if run_clicked || enter_run {
+                    self.run_command_palette_action();
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Quick actions")
+                        .weak()
+                        .font(mono_hint.clone()),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui
+                        .button(RichText::new("show cpu").font(mono_hint.clone()))
+                        .on_hover_text("Run read-only CPU snapshot (most common).")
+                        .clicked()
+                    {
+                        self.command_input = "show cpu".to_string();
                         self.run_command_palette_action();
                     }
-                });
-            } else {
-                ui.vertical(|ui| {
-                    let cmd_lbl = ui
-                        .label("Command")
-                        .on_hover_text("Single-line operator command; press Enter or Execute.");
-                    let edit_w = ui.available_width().max(120.0);
-                    let response = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.command_input)
-                                .id(egui::Id::new(ID_COMMAND_INPUT))
-                                .desired_width(edit_w)
-                                .hint_text("e.g. show cpu"),
-                        )
-                        .labelled_by(cmd_lbl.id);
-                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    response.on_hover_text("Type one command at a time.");
-                    ui.horizontal(|ui| {
-                        let exec = ui
-                            .button("Execute")
-                            .on_hover_text("Validate, authorize, and execute command.");
-                        exec.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Button, "Execute command")
+                    if ui
+                        .button(RichText::new("renice …").font(mono_hint.clone()))
+                        .on_hover_text("Insert template: renice <nice> <pid>  (nice −20…19).")
+                        .clicked()
+                    {
+                        self.command_input = "renice 0 ".to_string();
+                        ctx.memory_mut(|m| {
+                            m.request_focus(egui::Id::new(ID_COMMAND_INPUT));
                         });
-                        if exec.clicked() || enter {
-                            self.run_command_palette_action();
+                    }
+                    if self.trust_state == "PRIVILEGED" {
+                        if ui
+                            .button(RichText::new("kill …").font(mono_hint.clone()))
+                            .on_hover_text("Insert template: kill <pid>  (requires typed confirm).")
+                            .clicked()
+                        {
+                            self.command_input = "kill ".to_string();
+                            ctx.memory_mut(|m| {
+                                m.request_focus(egui::Id::new(ID_COMMAND_INPUT));
+                            });
+                        }
+                    } else {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(RichText::new("kill …").font(mono_hint.clone())),
+                        )
+                        .on_hover_text("Privileged mode only (kill is capability-gated).");
+                    }
+                });
+
+                let comps = filtered_command_completions(&self.command_input);
+                let show_chips = !comps.is_empty()
+                    && !(comps.len() == 1 && comps[0] == self.command_input.trim());
+                if show_chips {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Suggestions").weak().font(mono_hint.clone()));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for c in comps {
+                            let lbl: &'static str = match c {
+                                "renice " => "renice <nice> <pid>",
+                                "kill " => "kill <pid>",
+                                _ => c,
+                            };
+                            if ui
+                                .small_button(lbl)
+                                .on_hover_text(format!("Insert `{c}`"))
+                                .clicked()
+                            {
+                                self.command_input = c.to_string();
+                            }
                         }
                     });
-                });
-            }
-            if let Some(CommandAction::KillProcess { pid }) = self.pending_action.clone() {
-                let required = format!("KILL {}", pid);
-                ui.colored_label(
-                    egui::Color32::from_rgb(208, 72, 64),
-                    format!("Type `{required}` to confirm kill request"),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    let kill_lbl = ui.label("Kill confirmation");
-                    let confirm_w =
-                        (ui.available_width() - 200.0 - ui.spacing().item_spacing.x * 4.0).max(100.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.confirm_input)
-                            .desired_width(confirm_w)
-                            .hint_text(&required),
-                    )
-                    .labelled_by(kill_lbl.id);
-                    let conf = ui
-                        .button("Confirm")
-                        .on_hover_text("Execute confirmed kill action if policy/auth pass.");
-                    conf.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, "Confirm kill"));
-                    if conf.clicked() {
-                        if self.confirm_input.trim() == required {
-                            let action = CommandAction::KillProcess { pid };
-                            self.command_feedback = Some(match self.verify_auth_submission(&action) {
-                                Err(err) => err,
-                                Ok(()) => match self.policy.evaluate(&action) {
-                                    Ok(()) => {
-                                        let output = execute_action(&self.helper, action.clone());
-                                        self.policy.record(&action);
-                                        output
-                                    }
+                }
+            });
+
+        if let Some(CommandAction::KillProcess { pid }) = self.pending_action.clone() {
+            ui.add_space(8.0);
+            let required = format!("KILL {}", pid);
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(36, 18, 18))
+                .inner_margin(shell_inset)
+                .rounding(egui::Rounding::same(8.0))
+                .stroke(Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(140, 56, 52),
+                ))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new(format!("Destructive action — type `{required}` to confirm"))
+                            .color(egui::Color32::from_rgb(255, 190, 175))
+                            .font(FontId::new(13.0, FontFamily::Proportional)),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let kill_lbl = ui.label(RichText::new("confirm").font(mono_hint.clone()));
+                        let confirm_w =
+                            (ui.available_width() - 200.0 - ui.spacing().item_spacing.x * 4.0)
+                                .max(100.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.confirm_input)
+                                .font(mono.clone())
+                                .desired_width(confirm_w)
+                                .hint_text(&required),
+                        )
+                        .labelled_by(kill_lbl.id);
+                        let conf = ui
+                            .button("Confirm")
+                            .on_hover_text("Execute confirmed kill action if policy/auth pass.");
+                        conf.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, "Confirm kill")
+                        });
+                        if conf.clicked() {
+                            if self.confirm_input.trim() == required {
+                                let action = CommandAction::KillProcess { pid };
+                                self.command_feedback = Some(match self.verify_auth_submission(&action) {
                                     Err(err) => err,
-                                },
-                            });
+                                    Ok(()) => match self.policy.evaluate(&action) {
+                                        Ok(()) => {
+                                            let output = execute_action(&self.helper, action.clone());
+                                            self.policy.record(&action);
+                                            self.record_command_history(&format!("kill {pid}"));
+                                            self.command_input.clear();
+                                            self.history_browse = None;
+                                            self.history_draft.clear();
+                                            output
+                                        }
+                                        Err(err) => err,
+                                    },
+                                });
+                                self.pending_action = None;
+                                self.confirm_input.clear();
+                            } else {
+                                self.command_feedback =
+                                    Some("Confirmation mismatch.".to_string());
+                            }
+                        }
+                        let cancel = ui
+                            .button("Cancel")
+                            .on_hover_text("Clear pending destructive action (Esc).");
+                        cancel.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, "Cancel kill")
+                        });
+                        if cancel.clicked() {
                             self.pending_action = None;
                             self.confirm_input.clear();
-                        } else {
-                            self.command_feedback = Some("Confirmation mismatch.".to_string());
+                            self.command_feedback = Some("Action canceled.".to_string());
                         }
-                    }
-                    let cancel = ui
-                        .button("Cancel")
-                        .on_hover_text("Clear pending destructive action (Esc).");
-                    cancel.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, "Cancel kill"));
-                    if cancel.clicked() {
-                        self.pending_action = None;
-                        self.confirm_input.clear();
-                        self.command_feedback = Some("Action canceled.".to_string());
-                    }
+                    });
+                });
+        }
+
+        if let Some(msg) = &self.command_feedback {
+            ui.add_space(8.0);
+            if self.last_command_feedback_announced.as_ref() != Some(msg) {
+                self.last_command_feedback_announced = Some(msg.clone());
+                let mut info = egui::WidgetInfo::new(egui::WidgetType::Label);
+                info.label = Some(format!("Command result: {msg}"));
+                ctx.output_mut(|o| {
+                    o.events
+                        .push(egui::output::OutputEvent::ValueChanged(info));
                 });
             }
-            if let Some(msg) = &self.command_feedback {
-                let cat = classify_action_error(msg);
-                if msg.starts_with("DENIED") || msg.starts_with("Invalid") || msg.contains("denied") {
-                    warn!(category = cat.as_str(), message = %msg, "command feedback");
-                } else {
-                    info!(category = cat.as_str(), message = %msg, "command feedback");
-                }
-                if self.last_command_feedback_announced.as_ref() != Some(msg) {
-                    self.last_command_feedback_announced = Some(msg.clone());
-                    let mut info = egui::WidgetInfo::new(egui::WidgetType::Label);
-                    info.label = Some(format!("Command result: {msg}"));
-                    ctx.output_mut(|o| {
-                        o.events
-                            .push(egui::output::OutputEvent::ValueChanged(info));
-                    });
-                }
-                let status = ui
-                    .add(
-                        egui::Label::new(egui::RichText::new(msg).monospace())
+            let out_stroke = if msg.starts_with("DENIED")
+                || msg.starts_with("Invalid")
+                || msg.contains("denied")
+            {
+                Stroke::new(1.0, egui::Color32::from_rgb(120, 58, 54))
+            } else {
+                Stroke::new(1.0, egui::Color32::from_rgb(48, 72, 58))
+            };
+            let out_fill = if msg.starts_with("DENIED")
+                || msg.starts_with("Invalid")
+                || msg.contains("denied")
+            {
+                egui::Color32::from_rgb(28, 18, 18)
+            } else {
+                egui::Color32::from_rgb(18, 26, 22)
+            };
+            egui::Frame::none()
+                .fill(out_fill)
+                .inner_margin(shell_inset)
+                .rounding(egui::Rounding::same(8.0))
+                .stroke(out_stroke)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(RichText::new("Output").weak().font(mono_hint.clone()));
+                    ui.add_space(4.0);
+                    let out_text = egui::Color32::from_rgb(232, 238, 246);
+                    let status = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(msg.as_str())
+                                    .font(mono.clone())
+                                    .color(out_text),
+                            )
                             .wrap(true)
                             .sense(egui::Sense::hover()),
-                    )
-                    .on_hover_text(
-                        "Latest command outcome; assistive tech is notified when this text changes.",
-                    );
-                status.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("Command result: {msg}"))
+                        )
+                        .on_hover_text(
+                            "Latest command outcome; assistive tech is notified when this text changes.",
+                        );
+                    status.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("Command result: {msg}"))
+                    });
                 });
-            }
-            let collapsed = egui::CollapsingHeader::new("Advanced Controls").default_open(false);
-            let adv = collapsed.show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    icons::paint(ui, "settings", icons::SETTINGS, 14.0);
-                    ui.label("Power-user diagnostics and runtime metadata");
+        }
+
+        if !self.command_history.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Session history (newest first)")
+                    .weak()
+                    .font(mono_hint.clone()),
+            );
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_source("session_cmd_history_scroll")
+                .max_height(140.0)
+                .auto_shrink([true, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let entries: Vec<String> =
+                        self.command_history.iter().rev().cloned().collect();
+                    for line in entries {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(line.as_str())
+                                        .font(mono_hint.clone())
+                                        .color(egui::Color32::from_rgb(200, 210, 222)),
+                                )
+                                .wrap(true),
+                            );
+                            if ui
+                                .small_button("Reuse")
+                                .on_hover_text("Put this line in the shell (edit, then Enter).")
+                                .clicked()
+                            {
+                                self.command_input = line.clone();
+                                self.history_browse = None;
+                                self.history_draft.clear();
+                                ctx.memory_mut(|m| {
+                                    m.request_focus(egui::Id::new(ID_COMMAND_INPUT));
+                                });
+                            }
+                            if ui
+                                .small_button("Run")
+                                .on_hover_text("Execute this line again.")
+                                .clicked()
+                            {
+                                self.command_input = line;
+                                self.history_browse = None;
+                                self.history_draft.clear();
+                                self.run_command_palette_action();
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
                 });
-                ui.add(
-                    egui::Label::new(format!("helper_socket={}", self.helper.socket_path.display()))
-                        .wrap(true),
-                );
-                ui.add(
-                    egui::Label::new(format!("audit_path={}", self.helper.audit_path.display()))
-                        .wrap(true),
-                );
-                ui.monospace(format!("auth_failures={}", self.auth_failures));
-                ui.monospace(format!(
-                    "auth_lockout_active={}",
-                    self.auth_locked_until.map(|t| t > Instant::now()).unwrap_or(false)
-                ));
-                ui.add(
-                    egui::Label::new(format!("runtime={}", self.runtime_diagnostics)).wrap(true),
-                );
+        }
+
+        ui.add_space(8.0);
+        let collapsed = egui::CollapsingHeader::new("Advanced Controls").default_open(false);
+        let adv = collapsed.show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                icons::paint(ui, "settings", icons::SETTINGS, 14.0);
+                ui.label("Power-user diagnostics and runtime metadata");
             });
-            adv.header_response
-                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, "Advanced Controls"));
+            ui.add(
+                egui::Label::new(format!("helper_socket={}", self.helper.socket_path.display()))
+                    .wrap(true),
+            );
+            ui.add(
+                egui::Label::new(format!("audit_path={}", self.helper.audit_path.display()))
+                    .wrap(true),
+            );
+            ui.monospace(format!("auth_failures={}", self.auth_failures));
+            ui.monospace(format!(
+                "auth_lockout_active={}",
+                self.auth_locked_until.map(|t| t > Instant::now()).unwrap_or(false)
+            ));
+            ui.add(
+                egui::Label::new(format!("runtime={}", self.runtime_diagnostics)).wrap(true),
+            );
         });
+        adv.header_response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, "Advanced Controls"));
     }
 
     fn render_control_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -476,7 +800,7 @@ impl SentinelDashboard {
             ui.heading("Control");
         });
         ui.label(
-            egui::RichText::new("Command palette, auth, and execution feedback.").weak(),
+            egui::RichText::new("Operator shell, auth, and block-style output.").weak(),
         );
         ui.add_space(8.0);
         self.render_command_workbench(ui, ctx);
@@ -643,7 +967,7 @@ impl eframe::App for SentinelDashboard {
                             ui.set_min_width(ui.available_width());
                             ui.label("Navigation");
                             ui.monospace("- One scrollable dashboard: metrics, command palette, processes, audit.");
-                            ui.monospace("- Ctrl/⌘+K focuses the command field.");
+                            ui.monospace("- Operator shell: Tab complete, ↑↓ history, Enter run, Ctrl/⌘+K focus.");
                             ui.monospace("- Top bar shows live CPU/Mem/load plus trust and auth posture.");
                             ui.separator();
                             ui.label("Trust Modes");
@@ -685,7 +1009,7 @@ impl eframe::App for SentinelDashboard {
                             ui.monospace("1) Scroll the main area for metrics, command palette, processes, and audit.");
                             ui.monospace("2) Top bar shows live CPU/Mem/load chips plus Trust/Role/Auth.");
                             ui.monospace("3) Metrics: CPU (aggregate + per-core bars), memory, disk/network.");
-                            ui.monospace("4) Command Palette (Ctrl/⌘+K) for safe actions.");
+                            ui.monospace("4) Operator shell (Ctrl/⌘+K): Tab, history, Enter — no raw shell.");
                             ui.monospace("5) Top processes and Recent Audit Events below.");
                             ui.separator();
                             ui.heading("Command Examples");
@@ -706,7 +1030,8 @@ impl eframe::App for SentinelDashboard {
                             ui.separator();
                             ui.heading("Keyboard");
                             ui.monospace("F1 or ? — open this Help Center");
-                            ui.monospace("Ctrl/⌘+K — focus command field");
+                            ui.monospace("Ctrl/⌘+K — focus shell input");
+                            ui.monospace("Tab — complete first matching command · ↑↓ — history · Enter — run");
                             ui.monospace("Esc — close Help/Guide or cancel pending kill");
                             let close = ui
                                 .button("Close Help")
@@ -815,7 +1140,23 @@ fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         );
         return;
     }
-    for disk in snapshot.disks.iter().take(6) {
+    let mut rows: Vec<_> = snapshot.disks.iter().collect();
+    rows.sort_by_key(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec));
+    rows.reverse();
+    let total_rw: u64 = rows
+        .iter()
+        .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec))
+        .sum();
+    ui.label(
+        egui::RichText::new(format!(
+            "Top devices by R+W throughput ({} combined) — showing up to 10.",
+            human_bytes(total_rw)
+        ))
+        .weak()
+        .font(FontId::new(12.0, FontFamily::Proportional)),
+    );
+    ui.add_space(4.0);
+    for disk in rows.iter().take(10) {
         let total = disk
             .read_bytes_per_sec
             .saturating_add(disk.write_bytes_per_sec);
@@ -842,7 +1183,23 @@ fn network_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         );
         return;
     }
-    for net in snapshot.network.iter().take(6) {
+    let mut rows: Vec<_> = snapshot.network.iter().collect();
+    rows.sort_by_key(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec));
+    rows.reverse();
+    let total_io: u64 = rows
+        .iter()
+        .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec))
+        .sum();
+    ui.label(
+        egui::RichText::new(format!(
+            "Top interfaces by RX+TX ({} combined) — showing up to 10.",
+            human_bytes(total_io)
+        ))
+        .weak()
+        .font(FontId::new(12.0, FontFamily::Proportional)),
+    );
+    ui.add_space(4.0);
+    for net in rows.iter().take(10) {
         let total = net.rx_bytes_per_sec.saturating_add(net.tx_bytes_per_sec);
         let sev = throughput_severity(total);
         throughput_detail_row(
@@ -1004,6 +1361,68 @@ fn render_per_core_cpu(ui: &mut egui::Ui, per_core: &[f32]) {
     });
 }
 
+fn cpu_overview_extras(ui: &mut egui::Ui, cpu: &crate::models::cpu::CpuMetrics) {
+    ui.add_space(6.0);
+    let pc = &cpu.per_core;
+    if pc.is_empty() {
+        ui.label(
+            RichText::new("Per-core breakdown not available this tick.")
+                .weak()
+                .italics()
+                .font(FontId::new(12.5, FontFamily::Proportional)),
+        );
+        return;
+    }
+    let n = pc.len();
+    let mx = pc.iter().cloned().fold(0_f32, f32::max);
+    let mn = pc.iter().cloned().fold(100_f32, f32::min);
+    let sum: f32 = pc.iter().sum();
+    let avg = sum / n as f32;
+    ui.label(
+        RichText::new(format!(
+            "{n} logical CPUs · core avg {:.1}% · coolest {:.1}% · hottest {:.1}%",
+            avg, mn, mx
+        ))
+        .weak()
+        .font(FontId::new(12.5, FontFamily::Proportional)),
+    )
+    .on_hover_text("Instantaneous per-core utilization since the last sample; aggregate can differ slightly.");
+}
+
+fn memory_overview_extras(ui: &mut egui::Ui, m: &crate::models::memory::MemoryMetrics) {
+    ui.add_space(6.0);
+    if m.total == 0 {
+        return;
+    }
+    let avail_pct = (m.available as f32 / m.total as f32) * 100.0;
+    let used_pct = (m.used as f32 / m.total as f32) * 100.0;
+    ui.label(
+        RichText::new(format!(
+            "{} available ({:.0}% of total) · {} in use ({:.0}%)",
+            human_bytes(m.available),
+            avail_pct,
+            human_bytes(m.used),
+            used_pct
+        ))
+        .weak()
+        .font(FontId::new(12.5, FontFamily::Proportional)),
+    )
+    .on_hover_text("From /proc/meminfo: MemAvailable is memory for new work without pushing swap.");
+    let note = if avail_pct < 10.0 {
+        "Very low MemAvailable — risk of swap thrash or OOM under load."
+    } else if avail_pct < 20.0 {
+        "Limited headroom for bursty workloads."
+    } else {
+        "Comfortable headroom for new allocations."
+    };
+    ui.label(
+        RichText::new(note)
+            .weak()
+            .italics()
+            .font(FontId::new(12.0, FontFamily::Proportional)),
+    );
+}
+
 fn throughput_panel_heading(ui: &mut egui::Ui, icon_key: &str, icon_bytes: &'static [u8], title: &str, tip: &str) {
     ui.horizontal_top(|ui| {
         icons::paint(ui, icon_key, icon_bytes, 18.0);
@@ -1045,6 +1464,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                 ))
                 .on_hover_text("Load averages for 1, 5, and 15 minute windows.");
                 render_per_core_cpu(ui, &snapshot.cpu.per_core);
+                cpu_overview_extras(ui, &snapshot.cpu);
             });
             ui.group(|ui| {
                 ui.set_min_width(ui.available_width());
@@ -1082,6 +1502,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                     info.label = Some(format!("Memory usage {mem_pct} percent"));
                     info
                 });
+                memory_overview_extras(ui, &snapshot.memory);
             });
         });
     } else {
@@ -1106,6 +1527,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                     ))
                     .on_hover_text("Load averages for 1, 5, and 15 minute windows.");
                     render_per_core_cpu(ui, &snapshot.cpu.per_core);
+                    cpu_overview_extras(ui, &snapshot.cpu);
                 });
             });
             ui.vertical(|ui| {
@@ -1146,6 +1568,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                         info.label = Some(format!("Memory usage {mem_pct} percent"));
                         info
                     });
+                    memory_overview_extras(ui, &snapshot.memory);
                 });
             });
         });
