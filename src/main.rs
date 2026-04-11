@@ -30,7 +30,12 @@ fn main() -> anyhow::Result<()> {
         return run_benchmark_mode();
     }
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1040.0, 720.0])
+            .with_min_inner_size([360.0, 260.0]),
+        ..Default::default()
+    };
     let app = app::dashboard::SentinelDashboard::new()?;
 
     eframe::run_native(

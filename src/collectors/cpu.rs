@@ -32,6 +32,28 @@ impl CpuCollector {
             0.0
         };
 
+        let per_core = if let Some(prev) = &self.previous {
+            let n = current.cpu_time.len().min(prev.cpu_time.len());
+            (0..n)
+                .map(|i| {
+                    let p = &prev.cpu_time[i];
+                    let c = &current.cpu_time[i];
+                    let prev_total = cpu_total_ticks(p);
+                    let curr_total = cpu_total_ticks(c);
+                    let delta_total = curr_total.saturating_sub(prev_total);
+                    let delta_idle = c.idle.saturating_sub(p.idle);
+                    if delta_total == 0 {
+                        0.0
+                    } else {
+                        let pct = (1.0 - (delta_idle as f32 / delta_total as f32)) * 100.0;
+                        pct.clamp(0.0, 100.0)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         self.previous = Some(current);
 
         let load = LoadAverage::current().unwrap_or(procfs::LoadAverage {
@@ -45,7 +67,7 @@ impl CpuCollector {
 
         Ok(CpuMetrics {
             usage_percent,
-            per_core: Vec::new(),
+            per_core,
             load_avg: (load.one as f32, load.five as f32, load.fifteen as f32),
         })
     }

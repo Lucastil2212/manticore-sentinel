@@ -1,0 +1,20 @@
+//! Embedded SVG assets for the operator UI (single source of truth for `include_bytes!` paths).
+
+use eframe::egui;
+
+pub const MARK: &[u8] = include_bytes!("../../assets/icons/manticore-mark.svg");
+pub const SHIELD: &[u8] = include_bytes!("../../assets/icons/icon-shield.svg");
+pub const RADAR: &[u8] = include_bytes!("../../assets/icons/icon-radar.svg");
+pub const CPU: &[u8] = include_bytes!("../../assets/icons/icon-cpu.svg");
+pub const DISK: &[u8] = include_bytes!("../../assets/icons/icon-disk.svg");
+pub const NETWORK: &[u8] = include_bytes!("../../assets/icons/icon-network.svg");
+pub const COMMAND: &[u8] = include_bytes!("../../assets/icons/icon-command.svg");
+pub const AUDIT: &[u8] = include_bytes!("../../assets/icons/icon-audit.svg");
+pub const SETTINGS: &[u8] = include_bytes!("../../assets/icons/icon-settings.svg");
+
+/// Rasterize an embedded SVG at a square size. `uri_suffix` must be unique per asset for egui's image cache.
+pub fn paint(ui: &mut egui::Ui, uri_suffix: &str, bytes: &'static [u8], size: f32) {
+    let image = egui::Image::from_bytes(format!("bytes://{uri_suffix}.svg"), bytes)
+        .fit_to_exact_size(egui::vec2(size, size));
+    let _ = ui.add(image);
+}

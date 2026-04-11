@@ -12,9 +12,9 @@ impl MemoryCollector {
 
     pub fn collect(&self) -> anyhow::Result<MemoryMetrics> {
         let mem = Meminfo::current()?;
-        let total_bytes = mem.mem_total.saturating_mul(1024);
-        let available_kib = mem.mem_available.unwrap_or(mem.mem_free);
-        let available_bytes = available_kib.saturating_mul(1024);
+        // procfs Meminfo sizes are already converted to bytes (see Meminfo docs).
+        let total_bytes = mem.mem_total;
+        let available_bytes = mem.mem_available.unwrap_or(mem.mem_free);
         let used_bytes = total_bytes.saturating_sub(available_bytes);
 
         Ok(MemoryMetrics {
