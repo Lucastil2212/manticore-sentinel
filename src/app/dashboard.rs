@@ -215,7 +215,7 @@ impl SentinelDashboard {
             role: cfg.role,
         };
         let auth_gate = AuthGate::new(auth, cfg.auth_token.clone(), cfg.token_lifecycle);
-        let runtime_diagnostics = format!(
+        let mut runtime_diagnostics = format!(
             "profile={} privileged={} helper_mode={} refresh_ms={} role={} auth_mode={} token_ttl_secs={} peerweave={} evrus={}",
             cfg.profile,
             cfg.privileged,
@@ -250,6 +250,7 @@ impl SentinelDashboard {
 
         let mut engine = SentinelEngine::new();
         engine.init_connectors(&cfg.connectors);
+        runtime_diagnostics = format!("{runtime_diagnostics} hosts={}", engine.host_count());
         let connector_poll_interval = cfg
             .connectors
             .peerweave
@@ -343,6 +344,7 @@ impl SentinelDashboard {
                 if let Some(stream) = &self.event_stream {
                     let payload = serde_json::json!({
                         "timestamp": snapshot.timestamp,
+                        "host_id": snapshot.host_id,
                         "cpu_usage_percent": snapshot.cpu.usage_percent,
                         "load_avg": [snapshot.cpu.load_avg.0, snapshot.cpu.load_avg.1, snapshot.cpu.load_avg.2],
                         "memory_used": snapshot.memory.used,

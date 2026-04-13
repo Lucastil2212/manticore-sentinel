@@ -79,6 +79,7 @@ mod tests {
     fn sample_snapshot(timestamp: u64) -> SystemSnapshot {
         SystemSnapshot {
             timestamp,
+            host_id: "local-test".to_string(),
             cpu: CpuMetrics {
                 usage_percent: 12.5,
                 per_core: vec![10.0, 15.0],

@@ -8,11 +8,8 @@ use crate::core::snapshot::SystemSnapshot;
 use crate::utils::time::now_unix_secs;
 
 pub struct SentinelEngine {
-    cpu: CpuCollector,
-    memory: MemoryCollector,
-    process: ProcessCollector,
-    disk: DiskCollector,
-    network: NetworkCollector,
+    host_collectors: Vec<Box<dyn HostCollector>>,
+    primary_host_idx: usize,
     ecosystem_connectors: Vec<Box<dyn Connector>>,
     connector_poll_counter: u64,
 }
@@ -20,11 +17,8 @@ pub struct SentinelEngine {
 impl SentinelEngine {
     pub fn new() -> Self {
         Self {
-            cpu: CpuCollector::new(),
-            memory: MemoryCollector::new(),
-            process: ProcessCollector::new(),
-            disk: DiskCollector::new(),
-            network: NetworkCollector::new(),
+            host_collectors: vec![Box::new(LocalHostCollector::new())],
+            primary_host_idx: 0,
             ecosystem_connectors: Vec::new(),
             connector_poll_counter: 0,
         }
@@ -47,6 +41,58 @@ impl SentinelEngine {
     }
 
     pub async fn collect(&mut self) -> anyhow::Result<SystemSnapshot> {
+        let snapshots = self.collect_all()?;
+        snapshots
+            .get(self.primary_host_idx)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no primary host snapshot available"))
+    }
+
+    pub fn collect_all(&mut self) -> anyhow::Result<Vec<SystemSnapshot>> {
+        let mut out = Vec::new();
+        for collector in &mut self.host_collectors {
+            out.push(collector.collect()?);
+        }
+        Ok(out)
+    }
+
+    pub fn host_count(&self) -> usize {
+        self.host_collectors.len()
+    }
+}
+
+trait HostCollector: Send + Sync {
+    fn collect(&mut self) -> anyhow::Result<SystemSnapshot>;
+}
+
+struct LocalHostCollector {
+    host_id: String,
+    cpu: CpuCollector,
+    memory: MemoryCollector,
+    process: ProcessCollector,
+    disk: DiskCollector,
+    network: NetworkCollector,
+}
+
+impl LocalHostCollector {
+    fn new() -> Self {
+        let host_id = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        Self {
+            host_id,
+            cpu: CpuCollector::new(),
+            memory: MemoryCollector::new(),
+            process: ProcessCollector::new(),
+            disk: DiskCollector::new(),
+            network: NetworkCollector::new(),
+        }
+    }
+}
+
+impl HostCollector for LocalHostCollector {
+    fn collect(&mut self) -> anyhow::Result<SystemSnapshot> {
         let timestamp = now_unix_secs();
         let cpu = self.cpu.collect()?;
         let memory = self.memory.collect()?;
@@ -56,6 +102,7 @@ impl SentinelEngine {
 
         Ok(SystemSnapshot {
             timestamp,
+            host_id: self.host_id.clone(),
             cpu,
             memory,
             disks,
@@ -63,7 +110,9 @@ impl SentinelEngine {
             processes,
         })
     }
+}
 
+impl SentinelEngine {
     pub fn ingest_system_snapshot(&mut self, snapshot: &SystemSnapshot) {
         for conn in &mut self.ecosystem_connectors {
             conn.ingest_system_snapshot(snapshot);

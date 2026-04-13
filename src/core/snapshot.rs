@@ -8,6 +8,7 @@ use crate::models::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemSnapshot {
     pub timestamp: u64,
+    pub host_id: String,
     pub cpu: CpuMetrics,
     pub memory: MemoryMetrics,
     pub disks: Vec<DiskMetrics>,

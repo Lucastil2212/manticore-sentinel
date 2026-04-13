@@ -135,11 +135,16 @@ impl PeerWeaveConnector {
         let disk_write_bps: u64 = snapshot.disks.iter().map(|d| d.write_bytes_per_sec).sum();
         let network_rx_bps: u64 = snapshot.network.iter().map(|n| n.rx_bytes_per_sec).sum();
         let network_tx_bps: u64 = snapshot.network.iter().map(|n| n.tx_bytes_per_sec).sum();
-        let host_key = format!("host:{}", self.host_id);
+        let host_id = if snapshot.host_id.trim().is_empty() {
+            self.host_id.clone()
+        } else {
+            snapshot.host_id.clone()
+        };
+        let host_key = format!("host:{host_id}");
 
         json!({
             "timestamp": snapshot.timestamp,
-            "host": self.host_id,
+            "host": host_id,
             "trust_mode": self.trust_mode,
             "metrics": {
                 "cpu_usage_percent": snapshot.cpu.usage_percent,
