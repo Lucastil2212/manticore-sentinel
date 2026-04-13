@@ -149,6 +149,11 @@ pub struct SentinelDashboard {
     snapshot_history_recent_hour: usize,
     last_snapshot_history_probe: Instant,
     latest_alerts: Vec<AlertMatch>,
+    process_filter: String,
+    expanded_process_pid: Option<u32>,
+    audit_page: usize,
+    audit_page_size: usize,
+    expanded_audit_idx: Option<usize>,
     audit_retention: AuditRetentionConfig,
     config_warnings: Vec<ConfigWarning>,
     config_warnings_dismissed: bool,
@@ -340,6 +345,11 @@ impl SentinelDashboard {
             snapshot_history_recent_hour: 0,
             last_snapshot_history_probe: Instant::now() - Duration::from_secs(10),
             latest_alerts: Vec::new(),
+            process_filter: String::new(),
+            expanded_process_pid: None,
+            audit_page: 0,
+            audit_page_size: 50,
+            expanded_audit_idx: None,
             audit_retention: cfg.audit_retention.clone(),
             config_warnings: all_warnings,
             config_warnings_dismissed: false,
@@ -1581,74 +1591,193 @@ impl SentinelDashboard {
             )
             .labelled_by(lbl.id)
             .on_hover_text("Filter current audit window by text (case-insensitive).");
+            ui.separator();
+            ui.label("Page size");
+            for sz in [25, 50, 100] {
+                if ui
+                    .selectable_label(self.audit_page_size == sz, sz.to_string())
+                    .clicked()
+                {
+                    self.audit_page_size = sz;
+                    self.audit_page = 0;
+                }
+            }
         });
+
         let current_merkle = current_merkle_root(&self.helper.audit_path).ok().flatten();
         let anchored_current_window =
             current_merkle.as_deref() == self.anchor_state.last_anchor_merkle_root.as_deref();
-        ui.label(format!(
-            "Anchored window: {}",
-            if anchored_current_window { "yes" } else { "no" }
-        ));
-        ui.label(format!(
-            "Last anchor txid: {}",
-            self.anchor_state
-                .last_anchor_txid
-                .as_deref()
-                .unwrap_or("none")
-        ));
-        ui.label(format!(
-            "Last anchor blockheight: {}",
-            self.anchor_state
-                .last_anchor_blockheight
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
-        ui.label(format!(
-            "Last anchor timestamp: {}",
-            self.anchor_state
-                .last_anchor_ts
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
-        if let Some(root) = current_merkle {
-            ui.monospace(format!("Current Merkle root: {root}"));
-        }
+
+        egui::CollapsingHeader::new(RichText::new("Anchor & Merkle status").strong())
+            .id_source("audit-anchor-status")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(format!(
+                    "Anchored window: {}",
+                    if anchored_current_window { "yes" } else { "no" }
+                ));
+                ui.label(format!(
+                    "Last anchor txid: {}",
+                    self.anchor_state
+                        .last_anchor_txid
+                        .as_deref()
+                        .unwrap_or("none")
+                ));
+                ui.label(format!(
+                    "Last anchor blockheight: {}",
+                    self.anchor_state
+                        .last_anchor_blockheight
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+                ui.label(format!(
+                    "Last anchor timestamp: {}",
+                    self.anchor_state
+                        .last_anchor_ts
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+                if let Some(root) = current_merkle {
+                    ui.monospace(format!("Current Merkle root: {root}"));
+                }
+            });
         ui.separator();
+
+        let fetch_size = (self.audit_page + 1) * self.audit_page_size + self.audit_page_size;
         if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
-            self.audit_feed = read_recent(&self.helper.audit_path, 32).unwrap_or_default();
+            self.audit_feed = read_recent(&self.helper.audit_path, fetch_size).unwrap_or_default();
             self.last_audit_refresh = Instant::now();
         }
         if self.audit_feed.is_empty() {
             ui.label("No audit events yet.");
             return;
         }
+
         let filter = self.audit_filter.trim().to_ascii_lowercase();
-        for event in &self.audit_feed {
-            if !filter.is_empty() {
+        let filtered: Vec<&AuditEvent> = self
+            .audit_feed
+            .iter()
+            .filter(|event| {
+                if filter.is_empty() {
+                    return true;
+                }
                 let haystack = format!(
                     "{} {} {} {} {}",
                     event.action, event.target, event.result, event.actor, event.ts
                 )
                 .to_ascii_lowercase();
-                if !haystack.contains(&filter) {
-                    continue;
-                }
-            }
-            ui.monospace(format!(
-                "[{}] action={} target={} result={} actor={} policy={} txid={} bh={}",
-                event.ts,
-                event.action,
-                event.target,
-                event.result,
-                event.actor,
-                event.policy_hash.as_deref().unwrap_or("-"),
-                event.anchor_txid.as_deref().unwrap_or("-"),
-                event
-                    .anchor_blockheight
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            ));
+                haystack.contains(&filter)
+            })
+            .collect();
+
+        let total = filtered.len();
+        let total_pages = (total + self.audit_page_size - 1) / self.audit_page_size.max(1);
+        if self.audit_page >= total_pages && total_pages > 0 {
+            self.audit_page = total_pages - 1;
         }
+        let start = self.audit_page * self.audit_page_size;
+        let end = (start + self.audit_page_size).min(total);
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.audit_page > 0, egui::Button::new("◀ Prev"))
+                .clicked()
+            {
+                self.audit_page = self.audit_page.saturating_sub(1);
+                self.expanded_audit_idx = None;
+            }
+            ui.label(format!(
+                "Page {} of {} ({} events)",
+                self.audit_page + 1,
+                total_pages.max(1),
+                total
+            ));
+            if ui
+                .add_enabled(
+                    self.audit_page + 1 < total_pages,
+                    egui::Button::new("Next ▶"),
+                )
+                .clicked()
+            {
+                self.audit_page += 1;
+                self.expanded_audit_idx = None;
+            }
+        });
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_source("audit_events_scroll")
+            .max_height(ui.available_height().max(200.0))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (view_idx, event) in filtered[start..end].iter().enumerate() {
+                    let abs_idx = start + view_idx;
+                    let is_expanded = self.expanded_audit_idx == Some(abs_idx);
+                    let indicator = if is_expanded { "▾" } else { "▸" };
+                    let row_text = format!(
+                        "{} [{}] {} → {} ({})",
+                        indicator, event.ts, event.action, event.target, event.result
+                    );
+                    let resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(row_text)
+                                .font(FontId::new(12.0, FontFamily::Monospace))
+                                .color(if is_expanded {
+                                    egui::Color32::from_rgb(130, 205, 235)
+                                } else {
+                                    ui.visuals().text_color()
+                                }),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() {
+                        self.expanded_audit_idx = if is_expanded { None } else { Some(abs_idx) };
+                    }
+                    if is_expanded {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(16, 22, 30))
+                            .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                            .rounding(egui::Rounding::same(4.0))
+                            .show(ui, |ui| {
+                                ui.monospace(format!("timestamp:  {}", event.ts));
+                                ui.monospace(format!("action:     {}", event.action));
+                                ui.monospace(format!("target:     {}", event.target));
+                                ui.monospace(format!("result:     {}", event.result));
+                                ui.monospace(format!("actor:      {}", event.actor));
+                                ui.monospace(format!(
+                                    "signature:  {}",
+                                    event.sig.as_deref().unwrap_or("-")
+                                ));
+                                ui.monospace(format!(
+                                    "policy:     {}",
+                                    event.policy_hash.as_deref().unwrap_or("-")
+                                ));
+                                ui.monospace(format!(
+                                    "anchor_tx:  {}",
+                                    event.anchor_txid.as_deref().unwrap_or("-")
+                                ));
+                                ui.monospace(format!(
+                                    "anchor_bh:  {}",
+                                    event
+                                        .anchor_blockheight
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "-".to_string())
+                                ));
+                                ui.monospace(format!(
+                                    "merkle_root: {}",
+                                    event.anchor_merkle_root.as_deref().unwrap_or("-")
+                                ));
+                                if ui.small_button("Copy JSON").clicked() {
+                                    if let Ok(json) =
+                                        serde_json::to_string_pretty(event)
+                                    {
+                                        ui.output_mut(|o| o.copied_text = json);
+                                    }
+                                }
+                            });
+                    }
+                }
+            });
     }
 
     fn render_processes_view(&mut self, ui: &mut egui::Ui) {
@@ -1671,6 +1800,13 @@ impl SentinelDashboard {
                 .on_hover_text("PID ascending.");
             ui.selectable_value(&mut self.process_sort, ProcessSort::ThreadsDesc, "Threads")
                 .on_hover_text("Most threads first.");
+            ui.separator();
+            ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.process_filter)
+                    .desired_width(180.0)
+                    .hint_text("name or PID..."),
+            );
         });
         ui.separator();
         let Some(snapshot) = &self.latest else {
@@ -1679,13 +1815,29 @@ impl SentinelDashboard {
             return;
         };
         let mut rows: Vec<ProcessMetrics> = snapshot.processes.clone();
+        if !self.process_filter.is_empty() {
+            let q = self.process_filter.to_ascii_lowercase();
+            rows.retain(|p| {
+                p.name.to_ascii_lowercase().contains(&q)
+                    || p.pid.to_string().contains(&q)
+                    || p.cmdline.to_ascii_lowercase().contains(&q)
+            });
+        }
         match self.process_sort {
             ProcessSort::CpuDesc => rows.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
             ProcessSort::RssDesc => rows.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
             ProcessSort::PidAsc => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
             ProcessSort::ThreadsDesc => rows.sort_by(|a, b| b.threads.cmp(&a.threads)),
         }
-        process_metrics_table(ui, &rows);
+        ui.label(
+            RichText::new(format!("{} processes shown", rows.len()))
+                .weak()
+                .font(FontId::new(11.5, FontFamily::Proportional)),
+        );
+        let expanded = self.expanded_process_pid;
+        let mut new_expanded = expanded;
+        process_metrics_table_full(ui, &rows, expanded, &mut new_expanded);
+        self.expanded_process_pid = new_expanded;
     }
 
     fn render_network_view(&self, ui: &mut egui::Ui) {
@@ -2082,28 +2234,37 @@ fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         .sum();
     ui.label(
         egui::RichText::new(format!(
-            "Top devices by R+W throughput ({} combined) — showing up to 10.",
-            human_bytes(total_rw)
+            "All devices by R+W throughput ({} combined) — {} devices.",
+            human_bytes(total_rw),
+            rows.len()
         ))
         .weak()
         .font(FontId::new(12.0, FontFamily::Proportional)),
     );
     ui.add_space(4.0);
-    for disk in rows.iter().take(10) {
+    for disk in &rows {
         let total = disk
             .read_bytes_per_sec
             .saturating_add(disk.write_bytes_per_sec);
         let sev = throughput_severity(total);
-        throughput_detail_row(
-            ui,
-            sev,
-            format!(
+        let (sev_color, _) = severity_pill_colors(sev);
+        egui::CollapsingHeader::new(
+            RichText::new(format!(
                 "{} R:{} W:{}",
                 disk.device,
                 human_bytes(disk.read_bytes_per_sec),
                 human_bytes(disk.write_bytes_per_sec)
-            ),
-        );
+            ))
+            .color(sev_color),
+        )
+        .id_source(format!("disk-{}", disk.device))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.monospace(format!("device: {}", disk.device));
+            ui.monospace(format!("read:  {}/s", human_bytes(disk.read_bytes_per_sec)));
+            ui.monospace(format!("write: {}/s", human_bytes(disk.write_bytes_per_sec)));
+            ui.monospace(format!("total: {}/s", human_bytes(total)));
+        });
     }
 }
 
@@ -2125,31 +2286,45 @@ fn network_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         .sum();
     ui.label(
         egui::RichText::new(format!(
-            "Top interfaces by RX+TX ({} combined) — showing up to 10.",
-            human_bytes(total_io)
+            "All interfaces by RX+TX ({} combined) — {} interfaces.",
+            human_bytes(total_io),
+            rows.len()
         ))
         .weak()
         .font(FontId::new(12.0, FontFamily::Proportional)),
     );
     ui.add_space(4.0);
-    for net in rows.iter().take(10) {
+    for net in &rows {
         let total = net.rx_bytes_per_sec.saturating_add(net.tx_bytes_per_sec);
         let sev = throughput_severity(total);
-        throughput_detail_row(
-            ui,
-            sev,
-            format!(
+        let (sev_color, _) = severity_pill_colors(sev);
+        egui::CollapsingHeader::new(
+            RichText::new(format!(
                 "{} RX:{} TX:{}",
                 net.interface,
                 human_bytes(net.rx_bytes_per_sec),
                 human_bytes(net.tx_bytes_per_sec)
-            ),
-        );
+            ))
+            .color(sev_color),
+        )
+        .id_source(format!("net-{}", net.interface))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.monospace(format!("interface: {}", net.interface));
+            ui.monospace(format!("rx: {}/s", human_bytes(net.rx_bytes_per_sec)));
+            ui.monospace(format!("tx: {}/s", human_bytes(net.tx_bytes_per_sec)));
+            ui.monospace(format!("total: {}/s", human_bytes(total)));
+        });
     }
 }
 
 /// Full-width process table: fixed numeric columns, name column absorbs remaining width.
-fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
+fn process_metrics_table_full(
+    ui: &mut egui::Ui,
+    processes: &[ProcessMetrics],
+    expanded_pid: Option<u32>,
+    new_expanded: &mut Option<u32>,
+) {
     const PID_W: f32 = 80.0;
     const CPU_W: f32 = 74.0;
     const RSS_W: f32 = 100.0;
@@ -2171,7 +2346,7 @@ fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
             [name_w, 20.0],
             egui::Label::new(egui::RichText::new("Name").strong()).wrap(true),
         )
-        .on_hover_text("Executable or command name");
+        .on_hover_text("Executable or command name — click row for details");
         ui.add_sized(
             [CPU_W, 20.0],
             egui::Label::new(egui::RichText::new("CPU %").strong()),
@@ -2190,28 +2365,85 @@ fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
     });
     ui.separator();
 
-    for process in processes.iter().take(20) {
-        ui.horizontal_top(|ui| {
-            ui.add_sized(
-                [PID_W, 20.0],
-                egui::Label::new(process.pid.to_string()).wrap(false),
-            );
-            ui.vertical(|ui| {
-                ui.set_width(name_w);
-                ui.add(egui::Label::new(egui::RichText::new(process.name.as_str())).wrap(true));
-            });
-            ui.add_sized(
-                [CPU_W, 20.0],
-                egui::Label::new(format!("{:.2}", process.cpu_percent)),
-            );
-            ui.add_sized(
-                [RSS_W, 20.0],
-                egui::Label::new(human_bytes(process.memory_bytes)).wrap(false),
-            );
-            ui.add_sized([THR_W, 20.0], egui::Label::new(process.threads.to_string()));
+    egui::ScrollArea::vertical()
+        .id_source("process_table_scroll")
+        .max_height(ui.available_height().max(300.0))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for process in processes {
+                let is_expanded = expanded_pid == Some(process.pid);
+                let row_resp = ui
+                    .horizontal_top(|ui| {
+                        ui.add_sized(
+                            [PID_W, 20.0],
+                            egui::Label::new(process.pid.to_string()).wrap(false),
+                        );
+                        ui.vertical(|ui| {
+                            ui.set_width(name_w);
+                            let indicator = if is_expanded { "▾ " } else { "▸ " };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{}{}",
+                                        indicator, process.name
+                                    ))
+                                    .color(if is_expanded {
+                                        egui::Color32::from_rgb(130, 205, 235)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
+                                )
+                                .wrap(true)
+                                .sense(egui::Sense::click()),
+                            );
+                        });
+                        ui.add_sized(
+                            [CPU_W, 20.0],
+                            egui::Label::new(format!("{:.2}", process.cpu_percent)),
+                        );
+                        ui.add_sized(
+                            [RSS_W, 20.0],
+                            egui::Label::new(human_bytes(process.memory_bytes)).wrap(false),
+                        );
+                        ui.add_sized(
+                            [THR_W, 20.0],
+                            egui::Label::new(process.threads.to_string()),
+                        );
+                    })
+                    .response;
+
+                if row_resp.interact(egui::Sense::click()).clicked() {
+                    *new_expanded = if is_expanded {
+                        None
+                    } else {
+                        Some(process.pid)
+                    };
+                }
+
+                if is_expanded {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(16, 22, 30))
+                        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                        .rounding(egui::Rounding::same(4.0))
+                        .show(ui, |ui| {
+                            ui.monospace(format!("cmdline: {}", process.cmdline));
+                            ui.monospace(format!(
+                                "pid: {}  threads: {}  rss: {}  cpu: {:.2}%",
+                                process.pid,
+                                process.threads,
+                                human_bytes(process.memory_bytes),
+                                process.cpu_percent
+                            ));
+                        });
+                }
+                ui.add_space(2.0);
+            }
         });
-        ui.add_space(4.0);
-    }
+}
+
+fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
+    let mut ignored = None;
+    process_metrics_table_full(ui, &processes.iter().take(20).cloned().collect::<Vec<_>>(), None, &mut ignored);
 }
 
 fn cpu_util_fill(pct: f32) -> egui::Color32 {
@@ -2843,6 +3075,7 @@ fn severity_pill_colors(severity: ThroughputSeverity) -> (egui::Color32, egui::C
     }
 }
 
+#[allow(dead_code)]
 fn throughput_detail_row(ui: &mut egui::Ui, severity: ThroughputSeverity, detail: String) {
     let (fg, bg) = severity_pill_colors(severity);
     let badge = severity.label();
