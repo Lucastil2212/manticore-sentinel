@@ -5,7 +5,9 @@ use eframe::egui;
 use egui::{FontFamily, FontId, RichText, Stroke};
 use egui_extras::install_image_loaders;
 use tokio::runtime::Runtime;
+use base64::Engine;
 
+use crate::connectors::ConnectorSummary;
 use crate::core::{
     command::{parse_command, CommandAction},
     config::load_runtime_config,
@@ -15,13 +17,45 @@ use crate::core::{
 };
 use crate::models::process::ProcessMetrics;
 use crate::security::audit::{append_event, default_audit_path, now_ts, read_recent, AuditEvent};
-use crate::security::auth::{AuthContext, AuthGate, AuthMode};
+use crate::security::auth::{AuthContext, AuthGate, AuthMode, TokenLifecycle};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
+use crate::utils::time::now_unix_secs;
 use tracing::error;
 
 use super::icons;
 
 const ID_COMMAND_INPUT: &str = "command_palette_input";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DashboardView {
+    System,
+    PeerWeave,
+    Evrus,
+    Audit,
+    Connectors,
+}
+
+impl DashboardView {
+    fn all() -> [DashboardView; 5] {
+        [
+            DashboardView::System,
+            DashboardView::PeerWeave,
+            DashboardView::Evrus,
+            DashboardView::Audit,
+            DashboardView::Connectors,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DashboardView::System => "System",
+            DashboardView::PeerWeave => "PeerWeave",
+            DashboardView::Evrus => "EVRUS",
+            DashboardView::Audit => "Audit",
+            DashboardView::Connectors => "Connectors",
+        }
+    }
+}
 
 fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
     const ALL: &[&str] = &["show cpu", "renice ", "kill "];
@@ -68,6 +102,12 @@ pub struct SentinelDashboard {
     history_browse: Option<usize>,
     /// Line being edited before ↑ opened history (restored on ↓ from newest).
     history_draft: String,
+    connector_summary: ConnectorSummary,
+    last_connector_poll: Instant,
+    connector_poll_interval: Duration,
+    active_view: DashboardView,
+    token_lifecycle: Option<TokenLifecycle>,
+    evrus_jwt: Option<String>,
 }
 
 impl SentinelDashboard {
@@ -97,18 +137,31 @@ impl SentinelDashboard {
         };
         let auth_gate = AuthGate::new(auth, cfg.auth_token.clone(), cfg.token_lifecycle);
         let runtime_diagnostics = format!(
-            "profile={} privileged={} helper_mode={} refresh_ms={} role={} auth_mode={} token_ttl_secs={}",
+            "profile={} privileged={} helper_mode={} refresh_ms={} role={} auth_mode={} token_ttl_secs={} peerweave={} evrus={}",
             cfg.profile,
             cfg.privileged,
             cfg.helper_mode,
             cfg.refresh_ms,
             cfg.role.as_str(),
             cfg.auth_mode.as_str(),
-            cfg.token_lifecycle.map(|t| t.ttl_secs).unwrap_or(0)
+            cfg.token_lifecycle.map(|t| t.ttl_secs).unwrap_or(0),
+            if cfg.connectors.peerweave.is_some() { "on" } else { "off" },
+            if cfg.connectors.evrus.is_some() { "on" } else { "off" },
         );
+        let token_lifecycle = cfg.token_lifecycle;
+        let evrus_jwt = cfg.connectors.evrus.as_ref().and_then(|ev| ev.jwt.clone());
+
+        let mut engine = SentinelEngine::new();
+        engine.init_connectors(&cfg.connectors);
+        let connector_poll_interval = cfg
+            .connectors
+            .peerweave
+            .as_ref()
+            .map(|pw| Duration::from_millis(pw.poll_ms))
+            .unwrap_or(Duration::from_secs(5));
 
         Ok(Self {
-            engine: SentinelEngine::new(),
+            engine,
             runtime: Runtime::new()?,
             latest: None,
             last_poll: Instant::now() - Duration::from_millis(500),
@@ -136,6 +189,12 @@ impl SentinelDashboard {
             command_history: VecDeque::new(),
             history_browse: None,
             history_draft: String::new(),
+            connector_summary: ConnectorSummary::default(),
+            last_connector_poll: Instant::now() - Duration::from_secs(60),
+            connector_poll_interval,
+            active_view: DashboardView::System,
+            token_lifecycle,
+            evrus_jwt,
         })
     }
 
@@ -154,6 +213,13 @@ impl SentinelDashboard {
                 self.last_error = Some(err.to_string());
                 error!(category = "collector", message = %err, "snapshot collection failed");
             }
+        }
+
+        if self.engine.has_connectors()
+            && self.last_connector_poll.elapsed() >= self.connector_poll_interval
+        {
+            self.connector_summary = self.engine.poll_connectors();
+            self.last_connector_poll = Instant::now();
         }
     }
 
@@ -862,6 +928,307 @@ impl SentinelDashboard {
         }
     }
 
+    fn render_connectors_panel(&self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            icons::paint(ui, "connectors-network", icons::NETWORK, 18.0);
+            ui.heading("Ecosystem Connectors");
+        });
+        ui.label(
+            egui::RichText::new("PeerWeave and EVRUS integration status.")
+                .weak(),
+        );
+        ui.add_space(8.0);
+
+        if self.connector_summary.entries.is_empty() {
+            let passive = self.engine.connector_summary_passive();
+            if passive.entries.is_empty() {
+                ui.label("No connectors configured.");
+                ui.monospace(
+                    "Set MANTICORE_PEERWEAVE_ENABLED=true or MANTICORE_EVRUS_ENABLED=true to enable integrations.",
+                );
+                return;
+            }
+            for entry in &passive.entries {
+                self.render_connector_row(ui, entry);
+            }
+        } else {
+            for entry in &self.connector_summary.entries {
+                self.render_connector_row(ui, entry);
+            }
+        }
+    }
+
+    fn render_connector_row(&self, ui: &mut egui::Ui, health: &crate::connectors::ConnectorHealth) {
+        let mono_sm = FontId::new(12.0, FontFamily::Monospace);
+        let (badge_fg, badge_bg) = match &health.status {
+            crate::connectors::ConnectorStatus::Disabled => (
+                egui::Color32::from_rgb(130, 140, 150),
+                egui::Color32::from_rgb(30, 34, 40),
+            ),
+            crate::connectors::ConnectorStatus::Connecting => (
+                egui::Color32::from_rgb(130, 205, 235),
+                egui::Color32::from_rgb(24, 38, 50),
+            ),
+            crate::connectors::ConnectorStatus::Healthy => (
+                egui::Color32::from_rgb(100, 200, 130),
+                egui::Color32::from_rgb(20, 38, 26),
+            ),
+            crate::connectors::ConnectorStatus::Degraded(_) => (
+                egui::Color32::from_rgb(240, 200, 90),
+                egui::Color32::from_rgb(48, 42, 26),
+            ),
+            crate::connectors::ConnectorStatus::Failed(_) => (
+                egui::Color32::from_rgb(235, 110, 100),
+                egui::Color32::from_rgb(52, 28, 28),
+            ),
+        };
+        let label_text = health.status.label();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(" {label_text} "))
+                    .color(badge_fg)
+                    .background_color(badge_bg)
+                    .font(mono_sm.clone())
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(&health.name)
+                    .strong()
+                    .font(FontId::new(14.0, FontFamily::Proportional)),
+            );
+            if let Some(ms) = health.latency_ms {
+                ui.label(
+                    RichText::new(format!("{ms:.0}ms"))
+                        .weak()
+                        .font(mono_sm.clone()),
+                );
+            }
+            if let Some(detail) = &health.detail {
+                ui.label(
+                    RichText::new(detail.as_str())
+                        .weak()
+                        .font(FontId::new(12.5, FontFamily::Proportional)),
+                );
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    fn render_navigation_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for view in DashboardView::all() {
+                let selected = self.active_view == view;
+                if ui.selectable_label(selected, view.label()).clicked() {
+                    self.active_view = view;
+                }
+            }
+        });
+    }
+
+    fn connector_health_for(&self, name: &str) -> Option<crate::connectors::ConnectorHealth> {
+        if let Some(health) = self.connector_summary.health_for(name) {
+            return Some(health.clone());
+        }
+        let passive = self.engine.connector_summary_passive();
+        passive.health_for(name).cloned()
+    }
+
+    fn render_peerweave_view(&self, ui: &mut egui::Ui) {
+        ui.heading("PeerWeave");
+        let Some(health) = self.connector_health_for("PeerWeave") else {
+            ui.label("PeerWeave connector is disabled.");
+            ui.monospace("Enable with MANTICORE_PEERWEAVE_ENABLED=true");
+            return;
+        };
+        self.render_connector_row(ui, &health);
+
+        let Some(snapshot) = self.connector_summary.snapshot_for("PeerWeave") else {
+            ui.label("Waiting for PeerWeave snapshot data...");
+            return;
+        };
+
+        let payload = snapshot.data.get("data").unwrap_or(&snapshot.data);
+        let node = payload.get("node").cloned().unwrap_or_default();
+        let graph = payload.get("graph").cloned().unwrap_or_default();
+        ui.separator();
+        ui.label(
+            RichText::new(format!(
+                "Node: {}  |  Status: {}  |  Uptime: {}s",
+                node.get("peerId").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                node.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                node.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0)
+            ))
+            .strong(),
+        );
+        ui.label(format!(
+            "Peers: {}  |  Graph nodes: {}  |  Graph edges: {}",
+            node.get("peers")
+                .and_then(|p| p.get("count"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0),
+            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0)
+        ));
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Spaces").strong());
+        if let Some(spaces) = payload.get("spaces").and_then(|v| v.as_array()) {
+            if spaces.is_empty() {
+                ui.label("No spaces returned.");
+            } else {
+                for space in spaces.iter().take(16) {
+                    let name = space.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                    let sync = space
+                        .get("syncState")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let ops = space.get("opsCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                    ui.label(format!("{name} · sync={sync} · ops={ops}"));
+                }
+            }
+        } else {
+            ui.label("No spaces payload available.");
+        }
+    }
+
+    fn render_evrus_view(&self, ui: &mut egui::Ui) {
+        ui.heading("EVRUS");
+        let Some(health) = self.connector_health_for("EVRUS") else {
+            ui.label("EVRUS connector is disabled.");
+            ui.monospace("Enable with MANTICORE_EVRUS_ENABLED=true");
+            return;
+        };
+        self.render_connector_row(ui, &health);
+
+        ui.separator();
+        ui.label(format!("Auth mode: {}", self.auth_mode_label));
+        ui.label(format!("Role: {}", self.role_label));
+        if let Some(lifecycle) = self.token_lifecycle {
+            let now = now_unix_secs();
+            let expiry = lifecycle.issued_at.saturating_add(lifecycle.ttl_secs);
+            let remaining = expiry.saturating_sub(now);
+            ui.label(format!("Token expiry countdown: {}s", remaining));
+        } else {
+            ui.label("Token expiry countdown: n/a");
+        }
+
+        if let Some(jwt) = self.evrus_jwt.as_deref() {
+            if let Some(identity) = parse_identity_from_jwt(jwt) {
+                ui.label(format!("Operator DID: {}", identity.did.unwrap_or_else(|| "unknown".into())));
+                ui.label(format!(
+                    "Display name: {}",
+                    identity.display_name.unwrap_or_else(|| "unknown".into())
+                ));
+                if let Some(exp) = identity.exp {
+                    let remaining = exp.saturating_sub(now_unix_secs());
+                    ui.label(format!("JWT exp countdown: {}s", remaining));
+                }
+            } else {
+                ui.label("Operator identity: JWT configured, claims unavailable");
+            }
+        } else {
+            ui.label("Operator identity: no EVRUS JWT configured");
+        }
+
+        let anchor_enabled = self
+            .connector_summary
+            .snapshot_for("EVRUS")
+            .and_then(|s| s.data.get("anchor_enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        ui.label(format!(
+            "Vault connection: {}",
+            if matches!(health.status, crate::connectors::ConnectorStatus::Healthy) {
+                "healthy"
+            } else {
+                "degraded"
+            }
+        ));
+        ui.label(format!(
+            "Evrmore chain height: {}",
+            if anchor_enabled { "pending integration" } else { "anchoring disabled" }
+        ));
+        ui.label("Last audit anchor: pending integration");
+        ui.label("Policy summary: local execution policy active; EVRUS policy bridge pending");
+    }
+
+    fn render_audit_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Audit");
+        if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
+            self.audit_feed = read_recent(&self.helper.audit_path, 32).unwrap_or_default();
+            self.last_audit_refresh = Instant::now();
+        }
+        if self.audit_feed.is_empty() {
+            ui.label("No audit events yet.");
+            return;
+        }
+        for event in &self.audit_feed {
+            ui.monospace(format!(
+                "[{}] action={} target={} result={} actor={}",
+                event.ts, event.action, event.target, event.result, event.actor
+            ));
+        }
+    }
+
+    fn render_system_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, central_fill_w: f32) {
+        ui.horizontal_wrapped(|ui| {
+            icons::paint(ui, "overview-radar", icons::RADAR, 18.0);
+            ui.heading("Overview");
+        });
+        ui.label(
+            egui::RichText::new("CPU, memory, disk, and network at a glance.")
+                .weak(),
+        );
+        ui.add_space(8.0);
+        if let Some(snapshot) = &self.latest {
+            render_overview_metrics(ui, snapshot);
+        } else {
+            ui.spinner();
+            ui.label("Collecting first snapshot...");
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(12.0);
+
+        const CONTROL_ACTIVITY_SPLIT_PX: f32 = 1060.0;
+        if central_fill_w >= CONTROL_ACTIVITY_SPLIT_PX {
+            ui.horizontal_top(|ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let tw = ui.available_width();
+                let w_control = tw * 0.44;
+                let w_activity = (tw - w_control - gap).max(220.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(w_control);
+                    ui.set_max_width(w_control);
+                    self.render_control_section(ui, ctx);
+                });
+                ui.vertical(|ui| {
+                    ui.set_min_width(w_activity);
+                    ui.set_max_width(w_activity);
+                    if let Some(snapshot) = self.latest.clone() {
+                        self.render_activity_section(ui, &snapshot);
+                    } else {
+                        ui.spinner();
+                        ui.label("Collecting first snapshot...");
+                    }
+                });
+            });
+        } else {
+            self.render_control_section(ui, ctx);
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(12.0);
+            if let Some(snapshot) = self.latest.clone() {
+                self.render_activity_section(ui, &snapshot);
+            } else {
+                ui.spinner();
+                ui.label("Collecting first snapshot...");
+            }
+        }
+    }
+
     fn fill_vertical_remainder(&self, ui: &mut egui::Ui) {
         let h = ui.available_height();
         if h > 1.0 {
@@ -1069,60 +1436,15 @@ impl eframe::App for SentinelDashboard {
                         ui.separator();
                     }
 
-                    ui.horizontal_wrapped(|ui| {
-                        icons::paint(ui, "overview-radar", icons::RADAR, 18.0);
-                        ui.heading("Overview");
-                    });
-                    ui.label(
-                        egui::RichText::new("CPU, memory, disk, and network at a glance.")
-                            .weak(),
-                    );
-                    ui.add_space(8.0);
-                    if let Some(snapshot) = &self.latest {
-                        render_overview_metrics(ui, snapshot);
-                    } else {
-                        ui.spinner();
-                        ui.label("Collecting first snapshot...");
-                    }
-
-                    ui.add_space(16.0);
+                    self.render_navigation_tabs(ui);
                     ui.separator();
-                    ui.add_space(12.0);
-
-                    const CONTROL_ACTIVITY_SPLIT_PX: f32 = 1060.0;
-                    if central_fill_w >= CONTROL_ACTIVITY_SPLIT_PX {
-                        ui.horizontal_top(|ui| {
-                            let gap = ui.spacing().item_spacing.x;
-                            let tw = ui.available_width();
-                            let w_control = tw * 0.44;
-                            let w_activity = (tw - w_control - gap).max(220.0);
-                            ui.vertical(|ui| {
-                                ui.set_min_width(w_control);
-                                ui.set_max_width(w_control);
-                                self.render_control_section(ui, ctx);
-                            });
-                            ui.vertical(|ui| {
-                                ui.set_min_width(w_activity);
-                                ui.set_max_width(w_activity);
-                                if let Some(snapshot) = self.latest.clone() {
-                                    self.render_activity_section(ui, &snapshot);
-                                } else {
-                                    ui.spinner();
-                                    ui.label("Collecting first snapshot...");
-                                }
-                            });
-                        });
-                    } else {
-                        self.render_control_section(ui, ctx);
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(12.0);
-                        if let Some(snapshot) = self.latest.clone() {
-                            self.render_activity_section(ui, &snapshot);
-                        } else {
-                            ui.spinner();
-                            ui.label("Collecting first snapshot...");
-                        }
+                    ui.add_space(8.0);
+                    match self.active_view {
+                        DashboardView::System => self.render_system_view(ui, ctx, central_fill_w),
+                        DashboardView::PeerWeave => self.render_peerweave_view(ui),
+                        DashboardView::Evrus => self.render_evrus_view(ui),
+                        DashboardView::Audit => self.render_audit_view(ui),
+                        DashboardView::Connectors => self.render_connectors_panel(ui),
                     }
 
                     self.fill_vertical_remainder(ui);
@@ -1696,6 +2018,48 @@ fn execute_action(helper: &HelperRuntime, action: CommandAction) -> String {
             }
         }
     }
+}
+
+struct EvrusIdentity {
+    did: Option<String>,
+    display_name: Option<String>,
+    exp: Option<u64>,
+}
+
+fn parse_identity_from_jwt(jwt: &str) -> Option<EvrusIdentity> {
+    let mut parts = jwt.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let did = claims
+        .get("did")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+        });
+    let display_name = claims
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            claims
+                .get("preferred_username")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+        });
+    let exp = claims.get("exp").and_then(|v| v.as_u64());
+    Some(EvrusIdentity {
+        did,
+        display_name,
+        exp,
+    })
 }
 
 fn human_bytes(bytes: u64) -> String {

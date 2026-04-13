@@ -1,5 +1,6 @@
 mod app;
 mod collectors;
+mod connectors;
 mod core;
 mod models;
 mod security;

@@ -1,6 +1,29 @@
 use crate::security::auth::{AuthMode, Role, TokenLifecycle};
 
 #[derive(Debug, Clone)]
+pub struct PeerWeaveConfig {
+    pub graphql_url: String,
+    pub cap_token: Option<String>,
+    pub poll_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvrusConfig {
+    pub oidc_url: String,
+    pub jwt: Option<String>,
+    pub anchor_enabled: bool,
+    pub rpc_url: Option<String>,
+    pub rpc_user: Option<String>,
+    pub rpc_pass: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorConfig {
+    pub peerweave: Option<PeerWeaveConfig>,
+    pub evrus: Option<EvrusConfig>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub profile: String,
     pub privileged: bool,
@@ -10,6 +33,7 @@ pub struct RuntimeConfig {
     pub role: Role,
     pub auth_token: Option<String>,
     pub token_lifecycle: Option<TokenLifecycle>,
+    pub connectors: ConnectorConfig,
 }
 
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
@@ -98,6 +122,8 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         ));
     }
 
+    let connectors = load_connector_config();
+
     Ok(RuntimeConfig {
         profile,
         privileged,
@@ -107,7 +133,61 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         role,
         auth_token,
         token_lifecycle,
+        connectors,
     })
+}
+
+fn load_connector_config() -> ConnectorConfig {
+    let peerweave = if parse_bool_env("MANTICORE_PEERWEAVE_ENABLED", false).unwrap_or(false) {
+        let graphql_url = std::env::var("MANTICORE_PEERWEAVE_GRAPHQL_URL")
+            .unwrap_or_else(|_| "http://localhost:3200/graphql".to_string());
+        let cap_token = std::env::var("MANTICORE_PEERWEAVE_CAP_TOKEN").ok();
+        let poll_ms = std::env::var("MANTICORE_PEERWEAVE_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000)
+            .clamp(1000, 30000);
+        tracing::info!(
+            graphql_url = %graphql_url,
+            poll_ms = poll_ms,
+            "PeerWeave connector enabled"
+        );
+        Some(PeerWeaveConfig {
+            graphql_url,
+            cap_token,
+            poll_ms,
+        })
+    } else {
+        None
+    };
+
+    let evrus = if parse_bool_env("MANTICORE_EVRUS_ENABLED", false).unwrap_or(false) {
+        let oidc_url = std::env::var("MANTICORE_EVRUS_OIDC_URL")
+            .unwrap_or_else(|_| "http://localhost:8790".to_string());
+        let jwt = std::env::var("MANTICORE_EVRUS_JWT").ok();
+        let anchor_enabled =
+            parse_bool_env("MANTICORE_EVRUS_ANCHOR_ENABLED", false).unwrap_or(false);
+        let rpc_url = std::env::var("MANTICORE_EVRUS_RPC_URL").ok();
+        let rpc_user = std::env::var("MANTICORE_EVRUS_RPC_USER").ok();
+        let rpc_pass = std::env::var("MANTICORE_EVRUS_RPC_PASS").ok();
+        tracing::info!(
+            oidc_url = %oidc_url,
+            anchor_enabled = anchor_enabled,
+            "EVRUS connector enabled"
+        );
+        Some(EvrusConfig {
+            oidc_url,
+            jwt,
+            anchor_enabled,
+            rpc_url,
+            rpc_user,
+            rpc_pass,
+        })
+    } else {
+        None
+    };
+
+    ConnectorConfig { peerweave, evrus }
 }
 
 fn parse_bool_env(key: &str, default: bool) -> anyhow::Result<bool> {
