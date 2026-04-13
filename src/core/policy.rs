@@ -163,7 +163,17 @@ impl ExecutionPolicy {
 
     pub fn evaluate(&self, action: &CommandAction) -> Result<PolicyDecision, String> {
         let permission = match action {
-            CommandAction::ShowCpu => Permission::ViewSystemMetrics,
+            CommandAction::ShowCpu
+            | CommandAction::ShowMemory
+            | CommandAction::ShowDisk
+            | CommandAction::ShowNetwork
+            | CommandAction::ShowProcesses { .. }
+            | CommandAction::ShowAlerts
+            | CommandAction::ShowConfig
+            | CommandAction::ShowConnectors
+            | CommandAction::ShowAudit { .. }
+            | CommandAction::ShowStorage
+            | CommandAction::Help { .. } => Permission::ViewSystemMetrics,
             CommandAction::KillProcess { .. } => Permission::KillProcess,
             CommandAction::ReniceProcess { .. } => Permission::ReniceProcess,
         };
@@ -178,23 +188,16 @@ impl ExecutionPolicy {
         if let Some(evrus_policy) = &self.evrus_policy {
             self.evaluate_evrus_policy(action, evrus_policy)?;
         }
-        match action {
-            CommandAction::ShowCpu => Ok(PolicyDecision {
-                policy_hash: self.evrus_policy_hash.clone(),
-            }),
-            CommandAction::KillProcess { .. } | CommandAction::ReniceProcess { .. } => {
-                if let CommandAction::KillProcess { .. } = action {
-                    if let Some(last) = self.last_kill_at {
-                        if last.elapsed() < self.kill_cooldown {
-                            return Err("policy denied: kill action in cooldown window".to_string());
-                        }
-                    }
+        if let CommandAction::KillProcess { .. } = action {
+            if let Some(last) = self.last_kill_at {
+                if last.elapsed() < self.kill_cooldown {
+                    return Err("policy denied: kill action in cooldown window".to_string());
                 }
-                Ok(PolicyDecision {
-                    policy_hash: self.evrus_policy_hash.clone(),
-                })
             }
         }
+        Ok(PolicyDecision {
+            policy_hash: self.evrus_policy_hash.clone(),
+        })
     }
 
     pub fn record(&mut self, action: &CommandAction) {
@@ -245,9 +248,9 @@ impl ExecutionPolicy {
         policy: &SystemActionPolicy,
     ) -> Result<(), String> {
         let action_name = match action {
-            CommandAction::ShowCpu => "show_cpu",
             CommandAction::KillProcess { .. } => "kill_process",
             CommandAction::ReniceProcess { .. } => "renice_process",
+            _ => "read_only",
         };
         if policy.action != action_name && policy.action != "*" {
             return Ok(());
@@ -263,9 +266,9 @@ impl ExecutionPolicy {
         }
         if let Some(required) = &policy.constraints.require_capability {
             let action_capability = match action {
-                CommandAction::ShowCpu => "ViewSystemMetrics",
                 CommandAction::KillProcess { .. } => "KillProcess",
                 CommandAction::ReniceProcess { .. } => "ReniceProcess",
+                _ => "ViewSystemMetrics",
             };
             if !required.eq_ignore_ascii_case(action_capability) {
                 return Err(format!(

@@ -83,12 +83,12 @@ impl DashboardView {
 }
 
 fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
-    const ALL: &[&str] = &["show cpu", "renice ", "kill "];
     let low = typed.trim_start().to_ascii_lowercase();
     if low.is_empty() {
-        return ALL.to_vec();
+        return crate::core::command::COMMAND_COMPLETIONS.to_vec();
     }
-    ALL.iter()
+    crate::core::command::COMMAND_COMPLETIONS
+        .iter()
         .copied()
         .filter(|c| c.to_ascii_lowercase().starts_with(&low))
         .collect()
@@ -570,11 +570,175 @@ impl SentinelDashboard {
         }
     }
 
+    fn execute_read_only_command(&self, action: &CommandAction) -> Option<String> {
+        match action {
+            CommandAction::ShowMemory => {
+                let snap = self.latest.as_ref()?;
+                let m = &snap.memory;
+                let pct = if m.total > 0 {
+                    (m.used as f64 / m.total as f64 * 100.0).round()
+                } else {
+                    0.0
+                };
+                Some(format!(
+                    "Memory:\n  total:     {}\n  used:      {} ({:.0}%)\n  available: {}",
+                    human_bytes(m.total),
+                    human_bytes(m.used),
+                    pct,
+                    human_bytes(m.available)
+                ))
+            }
+            CommandAction::ShowDisk => {
+                let snap = self.latest.as_ref()?;
+                let mut out = String::from("Disk throughput:\n");
+                let mut sorted: Vec<_> = snap.disks.iter().collect();
+                sorted.sort_by_key(|d| std::cmp::Reverse(d.read_bytes_per_sec + d.write_bytes_per_sec));
+                for d in &sorted {
+                    out.push_str(&format!(
+                        "  {} R:{}/s W:{}/s\n",
+                        d.device,
+                        human_bytes(d.read_bytes_per_sec),
+                        human_bytes(d.write_bytes_per_sec)
+                    ));
+                }
+                Some(out)
+            }
+            CommandAction::ShowNetwork => {
+                let snap = self.latest.as_ref()?;
+                let mut out = String::from("Network throughput:\n");
+                let mut sorted: Vec<_> = snap.network.iter().collect();
+                sorted.sort_by_key(|n| std::cmp::Reverse(n.rx_bytes_per_sec + n.tx_bytes_per_sec));
+                for n in &sorted {
+                    out.push_str(&format!(
+                        "  {} RX:{}/s TX:{}/s\n",
+                        n.interface,
+                        human_bytes(n.rx_bytes_per_sec),
+                        human_bytes(n.tx_bytes_per_sec)
+                    ));
+                }
+                Some(out)
+            }
+            CommandAction::ShowProcesses { sort, limit } => {
+                let snap = self.latest.as_ref()?;
+                let mut procs: Vec<_> = snap.processes.clone();
+                match sort.as_deref() {
+                    Some("rss") => procs.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
+                    Some("pid") => procs.sort_by(|a, b| a.pid.cmp(&b.pid)),
+                    Some("threads") => procs.sort_by(|a, b| b.threads.cmp(&a.threads)),
+                    _ => procs.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
+                }
+                let lim = limit.unwrap_or(20);
+                let mut out = format!("Processes (top {} by {}):\n", lim, sort.as_deref().unwrap_or("cpu"));
+                out.push_str("  PID      CPU%    RSS          Name\n");
+                for p in procs.iter().take(lim) {
+                    out.push_str(&format!(
+                        "  {:<8} {:<7.2} {:<12} {}\n",
+                        p.pid,
+                        p.cpu_percent,
+                        human_bytes(p.memory_bytes),
+                        p.name
+                    ));
+                }
+                Some(out)
+            }
+            CommandAction::ShowAlerts => {
+                if self.latest_alerts.is_empty() {
+                    return Some("No active alerts.".to_string());
+                }
+                let mut out = String::from("Active alerts:\n");
+                for a in &self.latest_alerts {
+                    out.push_str(&format!(
+                        "  [{:?}] {} — {}\n",
+                        a.severity, a.rule_id, a.message
+                    ));
+                }
+                Some(out)
+            }
+            CommandAction::ShowConfig => {
+                let mut out = String::from("Effective configuration:\n");
+                out.push_str(&format!("  profile:           {}\n", self.runtime_diagnostics));
+                out.push_str(&format!("  auth_mode:         {}\n", self.auth_mode_label));
+                out.push_str(&format!("  role:              {}\n", self.role_label));
+                out.push_str(&format!("  trust:             {}\n", self.trust_state));
+                out.push_str(&format!("  audit_max_entries: {}\n", self.audit_retention.max_entries));
+                out.push_str(&format!("  audit_archive:     {}\n", self.audit_retention.archive_enabled));
+                out.push_str(&format!("  history_enabled:   {}\n", self.snapshot_history_enabled));
+                out.push_str(&format!("  history_max:       {}\n", self.snapshot_history_max_entries));
+                out.push_str(&format!("  sse:               {}\n", if self.event_stream.is_some() { "on" } else { "off" }));
+                if !self.config_warnings.is_empty() {
+                    out.push_str("\n  Warnings:\n");
+                    for w in &self.config_warnings {
+                        out.push_str(&format!("    [{}] {}\n", w.area, w.message));
+                    }
+                }
+                Some(out)
+            }
+            CommandAction::ShowConnectors => {
+                let summary = if self.connector_summary.entries.is_empty() {
+                    self.engine.connector_summary_passive()
+                } else {
+                    self.connector_summary.clone()
+                };
+                if summary.entries.is_empty() {
+                    return Some("No connectors configured. Set MANTICORE_PEERWEAVE_ENABLED=true or MANTICORE_EVRUS_ENABLED=true.".to_string());
+                }
+                let mut out = String::from("Connector status:\n");
+                for e in &summary.entries {
+                    out.push_str(&format!(
+                        "  {} — {:?}{}\n",
+                        e.name,
+                        e.status,
+                        e.detail
+                            .as_ref()
+                            .map(|d| format!(" ({})", d))
+                            .unwrap_or_default()
+                    ));
+                }
+                Some(out)
+            }
+            CommandAction::ShowAudit { last } => {
+                let events = read_recent(&self.helper.audit_path, *last).unwrap_or_default();
+                if events.is_empty() {
+                    return Some("No audit events.".to_string());
+                }
+                let mut out = format!("Last {} audit events:\n", events.len());
+                for e in &events {
+                    out.push_str(&format!(
+                        "  [{}] {} → {} ({}) by {}\n",
+                        e.ts, e.action, e.target, e.result, e.actor
+                    ));
+                }
+                Some(out)
+            }
+            CommandAction::ShowStorage => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let audit_path = default_audit_path(&cwd);
+                let audit_size = std::fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
+                let entries = audit_entry_count(&audit_path);
+                let snap_size = std::fs::metadata(&self.snapshot_history_path).map(|m| m.len()).unwrap_or(0);
+                let (arc_count, arc_bytes) = audit_archive_stats(&audit_path);
+                let mut out = String::from("Storage health:\n");
+                out.push_str(&format!("  audit events:   {} entries, {}\n", entries, format_bytes(audit_size)));
+                out.push_str(&format!("  audit max:      {}\n", self.audit_retention.max_entries));
+                out.push_str(&format!("  audit archive:  {} files, {}\n", arc_count, format_bytes(arc_bytes)));
+                out.push_str(&format!("  snapshots:      {}\n", format_bytes(snap_size)));
+                out.push_str(&format!("  snapshot max:   {}\n", self.snapshot_history_max_entries));
+                Some(out)
+            }
+            CommandAction::Help { topic } => {
+                Some(crate::core::command::help_text(topic.as_deref()))
+            }
+            _ => None,
+        }
+    }
+
     fn run_command_palette_action(&mut self) {
         let trimmed = self.command_input.trim().to_string();
         let (feedback, clear_line) = match parse_command(&trimmed) {
             Ok(action) => {
-                if let Err(err) = self.verify_auth_submission(&action) {
+                if let Some(output) = self.execute_read_only_command(&action) {
+                    (output, true)
+                } else if let Err(err) = self.verify_auth_submission(&action) {
                     (err, false)
                 } else if matches!(action, CommandAction::KillProcess { .. }) {
                     match self.policy.evaluate(&action) {
@@ -1095,6 +1259,11 @@ impl SentinelDashboard {
                     ui.label(RichText::new("Output").weak().font(mono_hint.clone()));
                     ui.add_space(4.0);
                     let out_text = egui::Color32::from_rgb(232, 238, 246);
+                    egui::ScrollArea::vertical()
+                        .id_source("command_output_scroll")
+                        .max_height(280.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
                     let status = ui
                         .add(
                             egui::Label::new(
@@ -1110,6 +1279,7 @@ impl SentinelDashboard {
                         );
                     status.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("Command result: {msg}"))
+                    });
                     });
                 });
         }
@@ -2822,9 +2992,9 @@ fn audit_auth_failure(
     retention: &AuditRetentionConfig,
 ) {
     let (action_name, target) = match action {
-        CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
         CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
         CommandAction::ReniceProcess { pid, .. } => ("renice_process", format!("pid:{pid}")),
+        _ => ("read_only", "system".to_string()),
     };
     let event = AuditEvent {
         ts: now_ts(),
@@ -2855,9 +3025,9 @@ fn audit_policy_denial(
     retention: &AuditRetentionConfig,
 ) {
     let (action_name, target) = match action {
-        CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
         CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
         CommandAction::ReniceProcess { pid, .. } => ("renice_process", format!("pid:{pid}")),
+        _ => ("read_only", "system".to_string()),
     };
     let event = AuditEvent {
         ts: now_ts(),
@@ -2938,6 +3108,7 @@ fn execute_action(
                 Err(err) => format!("Helper error: {err}"),
             }
         }
+        _ => "Read-only command handled inline.".to_string(),
     }
 }
 
