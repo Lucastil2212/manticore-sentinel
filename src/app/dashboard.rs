@@ -2013,7 +2013,8 @@ fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &s
             action: action_name.to_string(),
             target,
             result: format!("denied: auth_gate: {reason}"),
-                    actor: actor.to_string(),
+            actor: actor.to_string(),
+            sig: None,
         },
     );
 }
@@ -2029,6 +2030,7 @@ fn execute_action(helper: &HelperRuntime, action: CommandAction, actor: &str) ->
                     target: "system".to_string(),
                     result: "ok: local read action".to_string(),
                     actor: actor.to_string(),
+                    sig: None,
                 },
             );
             "Accepted: ShowCpu (local read-only action)".to_string()

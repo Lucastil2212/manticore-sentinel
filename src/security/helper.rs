@@ -188,6 +188,7 @@ fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capabili
                             format!("denied: {}", resp.message)
                         },
                         actor: "operator".to_string(),
+                        sig: None,
                     },
                 );
                 resp
