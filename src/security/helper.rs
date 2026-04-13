@@ -10,6 +10,7 @@ use std::{
 
 use nix::{
     libc,
+    sys::socket::{getsockopt, sockopt::PeerCredentials},
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
@@ -62,7 +63,9 @@ impl HelperServer {
         }
 
         let audit_path_for_thread = audit_path.clone();
-        let thread = thread::spawn(move || serve(listener, audit_path_for_thread, capabilities));
+        let allowed_uid = resolve_allowed_uid()?;
+        let thread =
+            thread::spawn(move || serve(listener, audit_path_for_thread, capabilities, allowed_uid));
 
         Ok(Self {
             socket_path,
@@ -164,15 +167,16 @@ fn write_response(stream: &mut UnixStream, response: &HelperResponse) -> anyhow:
     Ok(())
 }
 
-fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capability>) {
+fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capability>, allowed_uid: u32) {
     info!(socket = ?listener.local_addr().ok(), "helper service loop started");
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let request = read_request(&mut stream);
-        let response = match request {
+        let response = match verify_peer_identity(&stream, allowed_uid) {
+            Err(message) => deny(message.as_str()),
+            Ok(()) => match read_request(&mut stream) {
             Ok(req) => {
                 debug!(action = %req.action, pid = req.pid, "helper request received");
                 let resp = handle_request(&req, &capabilities);
@@ -200,6 +204,7 @@ fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capabili
             Err(err) => HelperResponse {
                 ok: false,
                 message: format!("invalid request: {err}"),
+            },
             },
         };
         if !response.ok {
@@ -285,8 +290,42 @@ pub fn run_helper_daemon_from_env() -> anyhow::Result<()> {
         let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
     }
 
-    serve(listener, audit_path, capabilities);
+    let allowed_uid = resolve_allowed_uid()?;
+    serve(listener, audit_path, capabilities, allowed_uid);
     Ok(())
+}
+
+fn resolve_allowed_uid() -> anyhow::Result<u32> {
+    if let Ok(raw) = std::env::var("MANTICORE_HELPER_ALLOWED_UID") {
+        let uid = raw
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("MANTICORE_HELPER_ALLOWED_UID must be an integer"))?;
+        return Ok(uid);
+    }
+    let uid = unsafe { libc::geteuid() as u32 };
+    Ok(uid)
+}
+
+fn verify_peer_identity(stream: &UnixStream, allowed_uid: u32) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let creds = getsockopt(stream, PeerCredentials)
+            .map_err(|e| format!("peer credential lookup failed: {e}"))?;
+        let peer_uid = creds.uid();
+        if peer_uid != allowed_uid {
+            return Err(format!(
+                "peer credential rejected: uid {} not allowed (expected {})",
+                peer_uid, allowed_uid
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        let _ = allowed_uid;
+        Ok(())
+    }
 }
 
 fn parse_capabilities(raw: &str) -> Vec<Capability> {
