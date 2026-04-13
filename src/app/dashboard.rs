@@ -157,6 +157,13 @@ pub struct SentinelDashboard {
     audit_retention: AuditRetentionConfig,
     config_warnings: Vec<ConfigWarning>,
     config_warnings_dismissed: bool,
+    show_view_help: bool,
+    show_connector_wizard: bool,
+    wizard_step: usize,
+    wizard_connector_type: usize,
+    wizard_url: String,
+    wizard_token: String,
+    wizard_space_id: String,
     self_collect_last_ms: f64,
     self_collect_avg_ms: f64,
     self_collect_cycles: u64,
@@ -353,6 +360,13 @@ impl SentinelDashboard {
             audit_retention: cfg.audit_retention.clone(),
             config_warnings: all_warnings,
             config_warnings_dismissed: false,
+            show_view_help: false,
+            show_connector_wizard: false,
+            wizard_step: 0,
+            wizard_connector_type: 0,
+            wizard_url: String::new(),
+            wizard_token: String::new(),
+            wizard_space_id: String::new(),
             self_collect_last_ms: 0.0,
             self_collect_avg_ms: 0.0,
             self_collect_cycles: 0,
@@ -1380,6 +1394,143 @@ impl SentinelDashboard {
         self.render_command_workbench(ui, ctx);
     }
 
+    fn render_connector_wizard(&mut self, ui: &mut egui::Ui) {
+        const TYPES: &[&str] = &["PeerWeave", "EVRUS", "SSE (Event Stream)"];
+        match self.wizard_step {
+            0 => {
+                ui.heading("Step 1: Choose Connector");
+                ui.label("Select which integration to configure:");
+                ui.add_space(8.0);
+                for (i, name) in TYPES.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.wizard_connector_type == i, *name)
+                        .clicked()
+                    {
+                        self.wizard_connector_type = i;
+                    }
+                }
+                ui.add_space(12.0);
+                if ui.button("Next →").clicked() {
+                    self.wizard_step = 1;
+                    self.wizard_url = match self.wizard_connector_type {
+                        0 => "http://localhost:3200/graphql".to_string(),
+                        1 => "http://localhost:8790".to_string(),
+                        _ => "9462".to_string(),
+                    };
+                }
+            }
+            1 => {
+                let name = TYPES[self.wizard_connector_type.min(2)];
+                ui.heading(format!("Step 2: Configure {name}"));
+                ui.add_space(8.0);
+                match self.wizard_connector_type {
+                    0 => {
+                        ui.label("GraphQL URL:");
+                        ui.text_edit_singleline(&mut self.wizard_url);
+                        ui.add_space(4.0);
+                        ui.label("CapToken (for graph.read):");
+                        ui.text_edit_singleline(&mut self.wizard_token);
+                        ui.add_space(4.0);
+                        ui.label("Publish Space ID (optional):");
+                        ui.text_edit_singleline(&mut self.wizard_space_id);
+                    }
+                    1 => {
+                        ui.label("OIDC URL:");
+                        ui.text_edit_singleline(&mut self.wizard_url);
+                        ui.add_space(4.0);
+                        ui.label("JWT Token:");
+                        ui.text_edit_singleline(&mut self.wizard_token);
+                    }
+                    _ => {
+                        ui.label("SSE Port:");
+                        ui.text_edit_singleline(&mut self.wizard_url);
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("← Back").clicked() {
+                        self.wizard_step = 0;
+                    }
+                    if ui.button("Generate Config →").clicked() {
+                        self.wizard_step = 2;
+                    }
+                });
+            }
+            _ => {
+                ui.heading("Step 3: Environment Variables");
+                ui.label("Add these to your shell or profile .env file:");
+                ui.add_space(8.0);
+                let env_block = match self.wizard_connector_type {
+                    0 => {
+                        let mut s = format!(
+                            "MANTICORE_PEERWEAVE_ENABLED=true\nMANTICORE_PEERWEAVE_GRAPHQL_URL={}\n",
+                            self.wizard_url
+                        );
+                        if !self.wizard_token.is_empty() {
+                            s.push_str(&format!(
+                                "MANTICORE_PEERWEAVE_CAP_TOKEN={}\n",
+                                self.wizard_token
+                            ));
+                        }
+                        if !self.wizard_space_id.is_empty() {
+                            s.push_str(&format!(
+                                "MANTICORE_PEERWEAVE_PUBLISH_ENABLED=true\nMANTICORE_PEERWEAVE_PUBLISH_SPACE_ID={}\n",
+                                self.wizard_space_id
+                            ));
+                        }
+                        s
+                    }
+                    1 => {
+                        let mut s = format!(
+                            "MANTICORE_EVRUS_ENABLED=true\nMANTICORE_EVRUS_OIDC_URL={}\n",
+                            self.wizard_url
+                        );
+                        if !self.wizard_token.is_empty() {
+                            s.push_str(&format!(
+                                "MANTICORE_EVRUS_JWT={}\n",
+                                self.wizard_token
+                            ));
+                        }
+                        s
+                    }
+                    _ => {
+                        format!(
+                            "MANTICORE_EVENT_STREAM_ENABLED=true\nMANTICORE_EVENT_STREAM_PORT={}\n",
+                            self.wizard_url
+                        )
+                    }
+                };
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(16, 22, 30))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .rounding(egui::Rounding::same(4.0))
+                    .show(ui, |ui| {
+                        ui.monospace(&env_block);
+                    });
+                ui.add_space(8.0);
+                if ui.button("Copy to Clipboard").clicked() {
+                    ui.output_mut(|o| o.copied_text = env_block.clone());
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Restart Sentinel after setting these variables for changes to take effect.")
+                        .weak()
+                        .italics(),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("← Back").clicked() {
+                        self.wizard_step = 1;
+                    }
+                    if ui.button("Done").clicked() {
+                        self.show_connector_wizard = false;
+                        self.wizard_step = 0;
+                    }
+                });
+            }
+        }
+    }
+
     fn render_activity_section(&mut self, ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -1436,12 +1587,22 @@ impl SentinelDashboard {
         }
     }
 
-    fn render_connectors_panel(&self, ui: &mut egui::Ui) {
+    fn render_connectors_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             icons::paint(ui, "connectors-network", icons::NETWORK, 18.0);
             ui.heading("Ecosystem Connectors");
         });
-        ui.label(egui::RichText::new("PeerWeave and EVRUS integration status.").weak());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("PeerWeave and EVRUS integration status.").weak());
+            if ui
+                .small_button("Setup Wizard")
+                .on_hover_text("Open guided connector setup")
+                .clicked()
+            {
+                self.show_connector_wizard = true;
+                self.wizard_step = 0;
+            }
+        });
         ui.add_space(8.0);
 
         if self.connector_summary.entries.is_empty() {
@@ -1597,6 +1758,14 @@ impl SentinelDashboard {
                 if tab.clicked() {
                     self.active_view = view;
                 }
+            }
+            ui.separator();
+            if ui
+                .small_button("(?)")
+                .on_hover_text("Open contextual help for this view")
+                .clicked()
+            {
+                self.show_view_help = true;
             }
         });
     }
@@ -2340,6 +2509,53 @@ impl eframe::App for SentinelDashboard {
                             if close.clicked() {
                                 self.show_help_center = false;
                             }
+                        });
+                });
+        }
+
+        if self.show_view_help {
+            egui::Window::new(format!("{} — Help", self.active_view.label()))
+                .collapsible(true)
+                .resizable(true)
+                .default_size(egui::vec2(520.0, 400.0))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_source("view_help_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let topic = match self.active_view {
+                                DashboardView::System => "commands",
+                                DashboardView::Processes => "commands",
+                                DashboardView::Network => "commands",
+                                DashboardView::PeerWeave => "peerweave",
+                                DashboardView::Evrus => "evrus",
+                                DashboardView::Audit => "audit",
+                                DashboardView::Connectors => "connectors",
+                            };
+                            let text = crate::core::command::help_text(Some(topic));
+                            ui.monospace(&text);
+                            ui.separator();
+                            ui.label(RichText::new("Related configuration:").strong());
+                            let config_text = crate::core::command::help_text(Some("config"));
+                            ui.monospace(&config_text);
+                            if ui.button("Close").clicked() {
+                                self.show_view_help = false;
+                            }
+                        });
+                });
+        }
+
+        if self.show_connector_wizard {
+            egui::Window::new("Connector Setup Wizard")
+                .collapsible(false)
+                .resizable(true)
+                .default_size(egui::vec2(520.0, 420.0))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_source("wizard_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_connector_wizard(ui);
                         });
                 });
         }
