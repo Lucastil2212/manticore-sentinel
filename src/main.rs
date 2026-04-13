@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     }
     if args.iter().any(|arg| arg == "--benchmark") {
         tracing::info!("starting benchmark mode");
-        return run_benchmark_mode();
+        return run_benchmark_mode(&config);
     }
 
     let options = eframe::NativeOptions {
@@ -79,10 +79,11 @@ fn load_profile_env(profile: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_benchmark_mode() -> anyhow::Result<()> {
+fn run_benchmark_mode(config: &core::config::RuntimeConfig) -> anyhow::Result<()> {
     use std::time::Instant;
 
     let mut engine = core::engine::SentinelEngine::new();
+    engine.init_connectors(&config.connectors);
     let runtime = tokio::runtime::Runtime::new()?;
     let iterations = 40u32;
 
@@ -94,6 +95,9 @@ fn run_benchmark_mode() -> anyhow::Result<()> {
     for _ in 0..iterations {
         let step = Instant::now();
         let _ = runtime.block_on(engine.collect())?;
+        if engine.has_connectors() {
+            let _ = engine.poll_connectors();
+        }
         total_ms += step.elapsed().as_secs_f64() * 1000.0;
     }
     let avg_ms = total_ms / iterations as f64;
