@@ -115,6 +115,7 @@ pub struct SentinelDashboard {
     evrus_anchor_config: Option<AnchorConfig>,
     anchor_interval: Duration,
     last_anchor_poll: Instant,
+    last_policy_hash: Option<String>,
 }
 
 impl SentinelDashboard {
@@ -216,6 +217,9 @@ impl SentinelDashboard {
             .map(|pw| Duration::from_millis(pw.poll_ms))
             .unwrap_or(Duration::from_secs(5));
 
+        let policy = ExecutionPolicy::new(auth, ExecutionPolicy::load_evrus_policy());
+        let last_policy_hash = policy.current_policy_hash();
+
         Ok(Self {
             engine,
             runtime: Runtime::new()?,
@@ -234,7 +238,7 @@ impl SentinelDashboard {
             pending_action: None,
             confirm_input: String::new(),
             last_audit_refresh: Instant::now() - Duration::from_secs(2),
-            policy: ExecutionPolicy::new(auth),
+            policy,
             auth_gate,
             auth_failures: 0,
             auth_locked_until: None,
@@ -255,6 +259,7 @@ impl SentinelDashboard {
             evrus_anchor_config,
             anchor_interval,
             last_anchor_poll: Instant::now() - anchor_interval,
+            last_policy_hash,
         })
     }
 
@@ -307,7 +312,13 @@ impl SentinelDashboard {
             if Instant::now() < until {
                 let remaining = until.saturating_duration_since(Instant::now()).as_secs();
                 let reason = format!("authentication locked: retry in {}s", remaining.max(1));
-                audit_auth_failure(&self.helper, action, &reason, &self.current_actor());
+                audit_auth_failure(
+                    &self.helper,
+                    action,
+                    &reason,
+                    &self.current_actor(),
+                    self.last_policy_hash.clone(),
+                );
                 return Err(reason);
             }
             self.auth_locked_until = None;
@@ -327,7 +338,13 @@ impl SentinelDashboard {
                     let lock_secs = ((self.auth_failures - 2) * 10).min(60) as u64;
                     self.auth_locked_until = Some(Instant::now() + Duration::from_secs(lock_secs));
                 }
-                audit_auth_failure(&self.helper, action, &err, &self.current_actor());
+                audit_auth_failure(
+                    &self.helper,
+                    action,
+                    &err,
+                    &self.current_actor(),
+                    self.last_policy_hash.clone(),
+                );
                 Err(err)
             }
         }
@@ -368,8 +385,18 @@ impl SentinelDashboard {
                     (err, false)
                 } else if matches!(action, CommandAction::KillProcess { .. }) {
                     match self.policy.evaluate(&action) {
-                        Err(err) => (err, false),
-                        Ok(()) => {
+                        Err(err) => {
+                            audit_policy_denial(
+                                &self.helper,
+                                &action,
+                                &err,
+                                &self.current_actor(),
+                                self.policy.current_policy_hash(),
+                            );
+                            (err, false)
+                        }
+                        Ok(decision) => {
+                            self.last_policy_hash = decision.policy_hash.clone();
                             self.pending_action = Some(action);
                             (
                                 "Confirmation required for destructive action.".to_string(),
@@ -379,10 +406,24 @@ impl SentinelDashboard {
                     }
                 } else {
                     match self.policy.evaluate(&action) {
-                        Err(err) => (err, false),
-                        Ok(()) => {
-                            let output =
-                                execute_action(&self.helper, action.clone(), &self.current_actor());
+                        Err(err) => {
+                            audit_policy_denial(
+                                &self.helper,
+                                &action,
+                                &err,
+                                &self.current_actor(),
+                                self.policy.current_policy_hash(),
+                            );
+                            (err, false)
+                        }
+                        Ok(decision) => {
+                            self.last_policy_hash = decision.policy_hash.clone();
+                            let output = execute_action(
+                                &self.helper,
+                                action.clone(),
+                                &self.current_actor(),
+                                self.last_policy_hash.clone(),
+                            );
                             self.policy.record(&action);
                             (output, true)
                         }
@@ -767,11 +808,13 @@ impl SentinelDashboard {
                                 self.command_feedback = Some(match self.verify_auth_submission(&action) {
                                     Err(err) => err,
                                     Ok(()) => match self.policy.evaluate(&action) {
-                                        Ok(()) => {
+                                        Ok(decision) => {
+                                            self.last_policy_hash = decision.policy_hash.clone();
                                             let output = execute_action(
                                                 &self.helper,
                                                 action.clone(),
                                                 &self.current_actor(),
+                                                self.last_policy_hash.clone(),
                                             );
                                             self.policy.record(&action);
                                             self.record_command_history(&format!("kill {pid}"));
@@ -780,7 +823,16 @@ impl SentinelDashboard {
                                             self.history_draft.clear();
                                             output
                                         }
-                                        Err(err) => err,
+                                        Err(err) => {
+                                            audit_policy_denial(
+                                                &self.helper,
+                                                &action,
+                                                &err,
+                                                &self.current_actor(),
+                                                self.policy.current_policy_hash(),
+                                            );
+                                            err
+                                        }
                                     },
                                 });
                                 self.pending_action = None;
@@ -2107,7 +2159,13 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
     }
 }
 
-fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &str, actor: &str) {
+fn audit_auth_failure(
+    helper: &HelperRuntime,
+    action: &CommandAction,
+    reason: &str,
+    actor: &str,
+    policy_hash: Option<String>,
+) {
     let (action_name, target) = match action {
         CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
         CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
@@ -2122,7 +2180,7 @@ fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &s
             result: format!("denied: auth_gate: {reason}"),
             actor: actor.to_string(),
             sig: None,
-            policy_hash: None,
+            policy_hash,
             anchor_txid: None,
             anchor_blockheight: None,
             anchor_merkle_root: None,
@@ -2130,7 +2188,41 @@ fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &s
     );
 }
 
-fn execute_action(helper: &HelperRuntime, action: CommandAction, actor: &str) -> String {
+fn audit_policy_denial(
+    helper: &HelperRuntime,
+    action: &CommandAction,
+    reason: &str,
+    actor: &str,
+    policy_hash: Option<String>,
+) {
+    let (action_name, target) = match action {
+        CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
+        CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
+        CommandAction::ReniceProcess { pid, .. } => ("renice_process", format!("pid:{pid}")),
+    };
+    let _ = append_event(
+        &helper.audit_path,
+        &AuditEvent {
+            ts: now_ts(),
+            action: action_name.to_string(),
+            target,
+            result: format!("denied: policy_gate: {reason}"),
+            actor: actor.to_string(),
+            sig: None,
+            policy_hash,
+            anchor_txid: None,
+            anchor_blockheight: None,
+            anchor_merkle_root: None,
+        },
+    );
+}
+
+fn execute_action(
+    helper: &HelperRuntime,
+    action: CommandAction,
+    actor: &str,
+    policy_hash: Option<String>,
+) -> String {
     match action {
         CommandAction::ShowCpu => {
             let _ = append_event(
@@ -2142,7 +2234,7 @@ fn execute_action(helper: &HelperRuntime, action: CommandAction, actor: &str) ->
                     result: "ok: local read action".to_string(),
                     actor: actor.to_string(),
                     sig: None,
-                    policy_hash: None,
+                    policy_hash,
                     anchor_txid: None,
                     anchor_blockheight: None,
                     anchor_merkle_root: None,
