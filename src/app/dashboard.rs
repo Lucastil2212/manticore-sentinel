@@ -164,6 +164,8 @@ pub struct SentinelDashboard {
     wizard_url: String,
     wizard_token: String,
     wizard_space_id: String,
+    detailed_mode: bool,
+    show_glossary: bool,
     self_collect_last_ms: f64,
     self_collect_avg_ms: f64,
     self_collect_cycles: u64,
@@ -367,6 +369,8 @@ impl SentinelDashboard {
             wizard_url: String::new(),
             wizard_token: String::new(),
             wizard_space_id: String::new(),
+            detailed_mode: false,
+            show_glossary: false,
             self_collect_last_ms: 0.0,
             self_collect_avg_ms: 0.0,
             self_collect_cycles: 0,
@@ -2394,6 +2398,26 @@ impl eframe::App for SentinelDashboard {
                             if help.clicked() {
                                 self.show_help_center = true;
                             }
+                            ui.separator();
+                            let mode_label = if self.detailed_mode {
+                                "Detailed"
+                            } else {
+                                "Compact"
+                            };
+                            if ui
+                                .small_button(mode_label)
+                                .on_hover_text("Toggle between compact (beginner) and detailed (advanced) view")
+                                .clicked()
+                            {
+                                self.detailed_mode = !self.detailed_mode;
+                            }
+                            if ui
+                                .small_button("Glossary")
+                                .on_hover_text("Open glossary of technical terms")
+                                .clicked()
+                            {
+                                self.show_glossary = true;
+                            }
                         });
                     });
                 });
@@ -2540,6 +2564,35 @@ impl eframe::App for SentinelDashboard {
                             ui.monospace(&config_text);
                             if ui.button("Close").clicked() {
                                 self.show_view_help = false;
+                            }
+                        });
+                });
+        }
+
+        if self.show_glossary {
+            egui::Window::new("Glossary of Technical Terms")
+                .collapsible(true)
+                .resizable(true)
+                .default_size(egui::vec2(520.0, 480.0))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_source("glossary_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (term, def) in GLOSSARY_ENTRIES {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(*term)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(130, 205, 235)),
+                                    );
+                                    ui.label(*def);
+                                });
+                                ui.add_space(2.0);
+                            }
+                            ui.separator();
+                            if ui.button("Close").clicked() {
+                                self.show_glossary = false;
                             }
                         });
                 });
@@ -3509,6 +3562,28 @@ fn render_quick_tile(ui: &mut egui::Ui, label: &str, value: String) {
             });
         });
 }
+
+const GLOSSARY_ENTRIES: &[(&str, &str)] = &[
+    ("CapToken", "Capability-based access token used by PeerWeave for fine-grained graph permissions."),
+    ("Merkle Root", "A single hash that cryptographically summarizes all audit events. Any change to any event changes the root."),
+    ("Ed25519", "A digital signature algorithm used to sign audit events, ensuring they haven't been tampered with."),
+    ("OP_RETURN", "A Bitcoin/Evrmore transaction output used to embed data (like a Merkle root) on the blockchain."),
+    ("OIDC", "OpenID Connect — an identity protocol. EVRUS uses it to issue JWTs for operator identity."),
+    ("JWT", "JSON Web Token — a compact, signed token containing identity claims (DID, role, expiry)."),
+    ("RBAC", "Role-Based Access Control — permissions granted based on role (viewer/operator/admin)."),
+    ("UDS", "Unix Domain Socket — local inter-process communication channel between core and helper."),
+    ("SSE", "Server-Sent Events — a protocol for streaming real-time telemetry from Sentinel over HTTP."),
+    ("JSONL", "JSON Lines — one JSON object per line. Used for audit events and snapshot history files."),
+    ("Anchor", "The act of writing a Merkle root to the Evrmore blockchain for tamper-evidence."),
+    ("DID", "Decentralized Identifier — a globally unique identity string from EVRUS."),
+    ("Connector", "An optional integration module (PeerWeave, EVRUS) that extends Sentinel's capabilities."),
+    ("Policy Gate", "Runtime check that evaluates role permissions and EVRUS policies before allowing actions."),
+    ("Auth Gate", "Authentication check that verifies token validity before command execution."),
+    ("Cooldown", "A minimum time interval between consecutive destructive actions (e.g., kill commands)."),
+    ("Profile", "A preset configuration (default/dev/secure/ecosystem) loaded from config/profiles/*.env."),
+    ("Helper", "A privilege-separated process that executes destructive actions (kill/renice) on behalf of the UI."),
+    ("Snapshot", "A point-in-time capture of all system metrics (CPU, memory, disk, network, processes)."),
+];
 
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
