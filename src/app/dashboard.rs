@@ -1453,6 +1453,8 @@ impl SentinelDashboard {
                 .weak(),
         );
         ui.add_space(8.0);
+        self.render_overview_quick_tiles(ui);
+        ui.add_space(8.0);
         if let Some(snapshot) = &self.latest {
             render_overview_metrics(ui, snapshot);
         } else {
@@ -1499,6 +1501,44 @@ impl SentinelDashboard {
                 ui.label("Collecting first snapshot...");
             }
         }
+    }
+
+    fn render_overview_quick_tiles(&self, ui: &mut egui::Ui) {
+        let Some(snapshot) = &self.latest else {
+            return;
+        };
+        let mem_pct = if snapshot.memory.total == 0 {
+            0.0
+        } else {
+            snapshot.memory.used as f32 / snapshot.memory.total as f32 * 100.0
+        };
+        let total_disk_bw: u64 = snapshot
+            .disks
+            .iter()
+            .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec))
+            .sum();
+        let total_net_bw: u64 = snapshot
+            .network
+            .iter()
+            .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec))
+            .sum();
+        let highest = throughput_severity(total_disk_bw.max(total_net_bw));
+        let (sev_fg, sev_bg) = severity_pill_colors(highest);
+
+        ui.horizontal_wrapped(|ui| {
+            render_quick_tile(ui, "CPU", format!("{:.1}%", snapshot.cpu.usage_percent));
+            render_quick_tile(ui, "MEM", format!("{:.0}%", mem_pct));
+            render_quick_tile(ui, "DISK BW", human_bytes(total_disk_bw));
+            render_quick_tile(ui, "NET BW", human_bytes(total_net_bw));
+            ui.label(
+                RichText::new(format!(" {} ", highest.label()))
+                    .color(sev_fg)
+                    .background_color(sev_bg)
+                    .font(FontId::new(12.0, FontFamily::Monospace))
+                    .strong(),
+            )
+            .on_hover_text("Highest throughput severity across disk/network.");
+        });
     }
 
     fn fill_vertical_remainder(&self, ui: &mut egui::Ui) {
@@ -1574,20 +1614,6 @@ impl eframe::App for SentinelDashboard {
                             if help.clicked() {
                                 self.show_help_center = true;
                             }
-                        });
-                        ui.add_space(4.0);
-                        let diag = ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new(format!("Diag: {}", self.runtime_diagnostics))
-                                        .font(FontId::new(11.5, FontFamily::Monospace))
-                                        .color(egui::Color32::from_rgb(158, 168, 180)),
-                                )
-                                .wrap(true),
-                            )
-                            .on_hover_text("Runtime configuration string for support and troubleshooting.");
-                        diag.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Label, "Runtime diagnostics")
                         });
                     });
                 });
@@ -2500,4 +2526,26 @@ fn throughput_detail_row(ui: &mut egui::Ui, severity: ThroughputSeverity, detail
         )
         .on_hover_text(hover);
     });
+}
+
+fn render_quick_tile(ui: &mut egui::Ui, label: &str, value: String) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(20, 28, 36))
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(Stroke::new(1.0, egui::Color32::from_rgb(42, 58, 74)))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(label)
+                        .font(FontId::new(11.5, FontFamily::Monospace))
+                        .weak(),
+                );
+                ui.label(
+                    RichText::new(value)
+                        .font(FontId::new(15.0, FontFamily::Proportional))
+                        .strong(),
+                );
+            });
+        });
 }
