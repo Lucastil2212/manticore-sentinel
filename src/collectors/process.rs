@@ -55,7 +55,11 @@ impl ProcessCollector {
         Ok(out)
     }
 
-    fn collect_one(&self, process: &Process, delta_total: u64) -> anyhow::Result<(ProcessMetrics, u64)> {
+    fn collect_one(
+        &self,
+        process: &Process,
+        delta_total: u64,
+    ) -> anyhow::Result<(ProcessMetrics, u64)> {
         let stat = process.stat()?;
         let pid = stat.pid as u32;
         let total_proc_ticks = stat.utime.saturating_add(stat.stime);

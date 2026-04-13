@@ -13,7 +13,12 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
     if raw.len() > 128 {
         return Err("command too long".to_string());
     }
-    if raw.contains('|') || raw.contains(';') || raw.contains('&') || raw.contains('>') || raw.contains('<') {
+    if raw.contains('|')
+        || raw.contains(';')
+        || raw.contains('&')
+        || raw.contains('>')
+        || raw.contains('<')
+    {
         return Err("shell operators are not allowed".to_string());
     }
 
@@ -28,7 +33,9 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             Ok(CommandAction::KillProcess { pid })
         }
         ["renice", nice, pid] => {
-            let nice = nice.parse::<i32>().map_err(|_| "invalid nice value".to_string())?;
+            let nice = nice
+                .parse::<i32>()
+                .map_err(|_| "invalid nice value".to_string())?;
             let pid = pid.parse::<u32>().map_err(|_| "invalid pid".to_string())?;
             if pid == 0 {
                 return Err("pid must be > 0".to_string());
@@ -38,7 +45,9 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             }
             Ok(CommandAction::ReniceProcess { pid, nice })
         }
-        _ => Err("unknown command. allowed: show cpu | kill <pid> | renice <nice> <pid>".to_string()),
+        _ => {
+            Err("unknown command. allowed: show cpu | kill <pid> | renice <nice> <pid>".to_string())
+        }
     }
 }
 

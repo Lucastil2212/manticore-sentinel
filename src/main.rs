@@ -63,7 +63,10 @@ fn profile_arg(args: &[String]) -> Option<String> {
 
 fn load_profile_env(profile: &str) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let path = cwd.join("config").join("profiles").join(format!("{profile}.env"));
+    let path = cwd
+        .join("config")
+        .join("profiles")
+        .join(format!("{profile}.env"));
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read profile {}: {}", path.display(), e))?;
     for line in raw.lines() {

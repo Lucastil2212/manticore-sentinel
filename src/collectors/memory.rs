@@ -1,5 +1,5 @@
-use procfs::Meminfo;
 use procfs::prelude::Current;
+use procfs::Meminfo;
 
 use crate::models::memory::MemoryMetrics;
 

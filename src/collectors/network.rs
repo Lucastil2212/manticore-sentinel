@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::Path,
-    time::Instant,
-};
+use std::{collections::HashMap, fs, path::Path, time::Instant};
 
 use crate::models::network::NetworkMetrics;
 
@@ -42,7 +37,11 @@ impl NetworkCollector {
             let tx_now = read_u64(stats_path.join("tx_bytes")).unwrap_or(0);
 
             let (rx_bps, tx_bps) = if elapsed > 0.0 {
-                let prev = self.previous.get(&iface).copied().unwrap_or((rx_now, tx_now));
+                let prev = self
+                    .previous
+                    .get(&iface)
+                    .copied()
+                    .unwrap_or((rx_now, tx_now));
                 let d_rx = rx_now.saturating_sub(prev.0);
                 let d_tx = tx_now.saturating_sub(prev.1);
                 (

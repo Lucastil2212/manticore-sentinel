@@ -109,10 +109,16 @@ fn canonical_event_payload(event: &AuditEvent) -> String {
         Value::Number(serde_json::Number::from(event.ts)),
     );
     if let Some(policy_hash) = &event.policy_hash {
-        map.insert("policy_hash".to_string(), Value::String(policy_hash.clone()));
+        map.insert(
+            "policy_hash".to_string(),
+            Value::String(policy_hash.clone()),
+        );
     }
     if let Some(anchor_txid) = &event.anchor_txid {
-        map.insert("anchor_txid".to_string(), Value::String(anchor_txid.clone()));
+        map.insert(
+            "anchor_txid".to_string(),
+            Value::String(anchor_txid.clone()),
+        );
     }
     if let Some(anchor_blockheight) = event.anchor_blockheight {
         map.insert(
@@ -300,12 +306,15 @@ fn submit_op_return_anchor(config: &AnchorConfig, merkle_root: &str) -> anyhow::
     let outputs = serde_json::json!({
         "data": hex_data
     });
-    let raw_tx = rpc_call(config, "createrawtransaction", serde_json::json!([[], outputs]))?
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("createrawtransaction response missing hex"))?
-        .to_string();
-    let funded =
-        rpc_call(config, "fundrawtransaction", serde_json::json!([raw_tx]))?;
+    let raw_tx = rpc_call(
+        config,
+        "createrawtransaction",
+        serde_json::json!([[], outputs]),
+    )?
+    .as_str()
+    .ok_or_else(|| anyhow::anyhow!("createrawtransaction response missing hex"))?
+    .to_string();
+    let funded = rpc_call(config, "fundrawtransaction", serde_json::json!([raw_tx]))?;
     let funded_hex = funded
         .get("hex")
         .and_then(|v| v.as_str())
@@ -321,10 +330,14 @@ fn submit_op_return_anchor(config: &AnchorConfig, merkle_root: &str) -> anyhow::
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("signrawtransactionwithwallet response missing hex"))?
         .to_string();
-    let txid = rpc_call(config, "sendrawtransaction", serde_json::json!([signed_hex]))?
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("sendrawtransaction response missing txid"))?
-        .to_string();
+    let txid = rpc_call(
+        config,
+        "sendrawtransaction",
+        serde_json::json!([signed_hex]),
+    )?
+    .as_str()
+    .ok_or_else(|| anyhow::anyhow!("sendrawtransaction response missing txid"))?
+    .to_string();
     Ok(txid)
 }
 
@@ -375,7 +388,11 @@ mod tests {
 
     fn temp_audit_file(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("manticore-audit-test-{}-{}.jsonl", std::process::id(), name));
+        p.push(format!(
+            "manticore-audit-test-{}-{}.jsonl",
+            std::process::id(),
+            name
+        ));
         let _ = fs::remove_file(&p);
         p
     }

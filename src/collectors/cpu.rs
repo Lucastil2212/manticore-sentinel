@@ -1,4 +1,7 @@
-use procfs::{prelude::{Current, CurrentSI}, CpuTime, KernelStats, LoadAverage};
+use procfs::{
+    prelude::{Current, CurrentSI},
+    CpuTime, KernelStats, LoadAverage,
+};
 
 use crate::models::cpu::CpuMetrics;
 

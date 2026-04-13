@@ -47,12 +47,19 @@ fn serve(
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if authorize_client(&mut stream, auth_mode, token_secret.as_deref(), evrus_jwt.as_deref()).is_ok()
+                if authorize_client(
+                    &mut stream,
+                    auth_mode,
+                    token_secret.as_deref(),
+                    evrus_jwt.as_deref(),
+                )
+                .is_ok()
                 {
                     let _ = stream.set_nonblocking(true);
                     clients.push(stream);
                 } else {
-                    let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}

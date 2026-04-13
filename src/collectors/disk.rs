@@ -34,7 +34,11 @@ impl DiskCollector {
             let write_bytes = stat.sectors_written.saturating_mul(512);
 
             let (read_bps, write_bps) = if elapsed > 0.0 {
-                let prev = self.previous.get(&key).copied().unwrap_or((read_bytes, write_bytes));
+                let prev = self
+                    .previous
+                    .get(&key)
+                    .copied()
+                    .unwrap_or((read_bytes, write_bytes));
                 let d_read = read_bytes.saturating_sub(prev.0);
                 let d_write = write_bytes.saturating_sub(prev.1);
                 (

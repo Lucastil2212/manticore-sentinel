@@ -10,8 +10,8 @@ use std::{
 
 use nix::{
     libc,
-    sys::socket::{getsockopt, sockopt::PeerCredentials},
     sys::signal::{kill, Signal},
+    sys::socket::{getsockopt, sockopt::PeerCredentials},
     unistd::Pid,
 };
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,11 @@ pub struct HelperRuntime {
 }
 
 impl HelperServer {
-    pub fn spawn(socket_path: PathBuf, audit_path: PathBuf, capabilities: Vec<Capability>) -> anyhow::Result<Self> {
+    pub fn spawn(
+        socket_path: PathBuf,
+        audit_path: PathBuf,
+        capabilities: Vec<Capability>,
+    ) -> anyhow::Result<Self> {
         if socket_path.exists() {
             let _ = fs::remove_file(&socket_path);
         }
@@ -64,8 +68,9 @@ impl HelperServer {
 
         let audit_path_for_thread = audit_path.clone();
         let allowed_uid = resolve_allowed_uid()?;
-        let thread =
-            thread::spawn(move || serve(listener, audit_path_for_thread, capabilities, allowed_uid));
+        let thread = thread::spawn(move || {
+            serve(listener, audit_path_for_thread, capabilities, allowed_uid)
+        });
 
         Ok(Self {
             socket_path,
@@ -81,7 +86,11 @@ impl Drop for HelperServer {
 }
 
 impl HelperRuntime {
-    pub fn start_embedded(socket_path: PathBuf, audit_path: PathBuf, capabilities: Vec<Capability>) -> anyhow::Result<Self> {
+    pub fn start_embedded(
+        socket_path: PathBuf,
+        audit_path: PathBuf,
+        capabilities: Vec<Capability>,
+    ) -> anyhow::Result<Self> {
         let server = HelperServer::spawn(socket_path.clone(), audit_path.clone(), capabilities)?;
         Ok(Self {
             socket_path,
@@ -91,7 +100,11 @@ impl HelperRuntime {
         })
     }
 
-    pub fn start_subprocess(socket_path: PathBuf, audit_path: PathBuf, capabilities: Vec<Capability>) -> anyhow::Result<Self> {
+    pub fn start_subprocess(
+        socket_path: PathBuf,
+        audit_path: PathBuf,
+        capabilities: Vec<Capability>,
+    ) -> anyhow::Result<Self> {
         if socket_path.exists() {
             let _ = fs::remove_file(&socket_path);
         }
@@ -116,7 +129,10 @@ impl HelperRuntime {
         )?;
         if !health.ok {
             error!(message = %health.message, "helper healthcheck failed");
-            return Err(anyhow::anyhow!("helper healthcheck failed: {}", health.message));
+            return Err(anyhow::anyhow!(
+                "helper healthcheck failed: {}",
+                health.message
+            ));
         }
         info!("helper subprocess healthcheck passed");
 
@@ -167,7 +183,12 @@ fn write_response(stream: &mut UnixStream, response: &HelperResponse) -> anyhow:
     Ok(())
 }
 
-fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capability>, allowed_uid: u32) {
+fn serve(
+    listener: UnixListener,
+    audit_path: PathBuf,
+    capabilities: Vec<Capability>,
+    allowed_uid: u32,
+) {
     info!(socket = ?listener.local_addr().ok(), "helper service loop started");
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -177,34 +198,34 @@ fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capabili
         let response = match verify_peer_identity(&stream, allowed_uid) {
             Err(message) => deny(message.as_str()),
             Ok(()) => match read_request(&mut stream) {
-            Ok(req) => {
-                debug!(action = %req.action, pid = req.pid, "helper request received");
-                let resp = handle_request(&req, &capabilities);
-                let _ = append_event(
-                    &audit_path,
-                    &AuditEvent {
-                        ts: now_ts(),
-                        action: req.action.clone(),
-                        target: format!("pid:{}", req.pid),
-                        result: if resp.ok {
-                            format!("ok: {}", resp.message)
-                        } else {
-                            format!("denied: {}", resp.message)
+                Ok(req) => {
+                    debug!(action = %req.action, pid = req.pid, "helper request received");
+                    let resp = handle_request(&req, &capabilities);
+                    let _ = append_event(
+                        &audit_path,
+                        &AuditEvent {
+                            ts: now_ts(),
+                            action: req.action.clone(),
+                            target: format!("pid:{}", req.pid),
+                            result: if resp.ok {
+                                format!("ok: {}", resp.message)
+                            } else {
+                                format!("denied: {}", resp.message)
+                            },
+                            actor: "operator".to_string(),
+                            sig: None,
+                            policy_hash: None,
+                            anchor_txid: None,
+                            anchor_blockheight: None,
+                            anchor_merkle_root: None,
                         },
-                        actor: "operator".to_string(),
-                        sig: None,
-                        policy_hash: None,
-                        anchor_txid: None,
-                        anchor_blockheight: None,
-                        anchor_merkle_root: None,
-                    },
-                );
-                resp
-            }
-            Err(err) => HelperResponse {
-                ok: false,
-                message: format!("invalid request: {err}"),
-            },
+                    );
+                    resp
+                }
+                Err(err) => HelperResponse {
+                    ok: false,
+                    message: format!("invalid request: {err}"),
+                },
             },
         };
         if !response.ok {
@@ -391,7 +412,8 @@ mod tests {
     fn uds_denies_when_capability_missing() {
         let socket = unique_path("deny.sock");
         let audit = unique_path("deny.jsonl");
-        let server = HelperServer::spawn(socket.clone(), audit.clone(), vec![]).expect("spawn helper");
+        let server =
+            HelperServer::spawn(socket.clone(), audit.clone(), vec![]).expect("spawn helper");
         wait_for_socket(&socket);
 
         let response = send_request(
@@ -455,8 +477,9 @@ mod tests {
     fn uds_kill_success_path() {
         let socket = unique_path("success.sock");
         let audit = unique_path("success.jsonl");
-        let server = HelperServer::spawn(socket.clone(), audit.clone(), vec![Capability::KillProcess])
-            .expect("spawn helper");
+        let server =
+            HelperServer::spawn(socket.clone(), audit.clone(), vec![Capability::KillProcess])
+                .expect("spawn helper");
         wait_for_socket(&socket);
 
         let mut child = Command::new("sleep")
@@ -474,7 +497,11 @@ mod tests {
         )
         .expect("send request");
 
-        assert!(response.ok, "expected success response, got: {}", response.message);
+        assert!(
+            response.ok,
+            "expected success response, got: {}",
+            response.message
+        );
         let _ = child.wait();
 
         drop(server);
