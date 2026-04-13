@@ -1596,6 +1596,7 @@ impl eframe::App for SentinelDashboard {
                         );
                         ui.add_space(6.0);
                         ui.horizontal_wrapped(|ui| {
+                            icons::paint(ui, "security-guide-icon", icons::SHIELD, 14.0);
                             let guide = ui
                                 .button("Security Guide")
                                 .on_hover_text("Open security posture and destructive-action guidance.");
@@ -1605,6 +1606,7 @@ impl eframe::App for SentinelDashboard {
                             if guide.clicked() {
                                 self.show_onboarding = true;
                             }
+                            icons::paint(ui, "help-center-icon", icons::HELP, 14.0);
                             let help = ui
                                 .button("Help Center")
                                 .on_hover_text("Open full in-app navigation and command help (F1).");
@@ -2091,7 +2093,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
             });
             ui.group(|ui| {
                 ui.set_min_width(ui.available_width());
-                icons::paint(ui, "shield", icons::SHIELD, 16.0);
+                icons::paint(ui, "memory", icons::MEMORY, 16.0);
                 ui.label(RichText::new("Memory").font(FontId::new(13.0, FontFamily::Proportional)))
                     .on_hover_text("Memory available for new programs (approx.) versus total RAM.");
                 ui.add_space(2.0);
@@ -2157,7 +2159,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                 ui.set_width(col_w);
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width());
-                    icons::paint(ui, "shield", icons::SHIELD, 16.0);
+                    icons::paint(ui, "memory", icons::MEMORY, 16.0);
                     ui.label(RichText::new("Memory").font(FontId::new(13.0, FontFamily::Proportional)))
                         .on_hover_text("Memory available for new programs (approx.) versus total RAM.");
                     ui.add_space(2.0);
