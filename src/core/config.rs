@@ -12,6 +12,7 @@ pub struct EvrusConfig {
     pub oidc_url: String,
     pub jwt: Option<String>,
     pub anchor_enabled: bool,
+    pub anchor_interval_secs: u64,
     pub rpc_url: Option<String>,
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
@@ -167,18 +168,25 @@ fn load_connector_config() -> ConnectorConfig {
         let jwt = std::env::var("MANTICORE_EVRUS_JWT").ok();
         let anchor_enabled =
             parse_bool_env("MANTICORE_EVRUS_ANCHOR_ENABLED", false).unwrap_or(false);
+        let anchor_interval_secs = std::env::var("MANTICORE_EVRUS_ANCHOR_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300)
+            .clamp(30, 86_400);
         let rpc_url = std::env::var("MANTICORE_EVRUS_RPC_URL").ok();
         let rpc_user = std::env::var("MANTICORE_EVRUS_RPC_USER").ok();
         let rpc_pass = std::env::var("MANTICORE_EVRUS_RPC_PASS").ok();
         tracing::info!(
             oidc_url = %oidc_url,
             anchor_enabled = anchor_enabled,
+            anchor_interval_secs = anchor_interval_secs,
             "EVRUS connector enabled"
         );
         Some(EvrusConfig {
             oidc_url,
             jwt,
             anchor_enabled,
+            anchor_interval_secs,
             rpc_url,
             rpc_user,
             rpc_pass,

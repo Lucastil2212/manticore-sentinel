@@ -93,6 +93,8 @@ impl Connector for EvrusConnector {
                 "oidc_healthy": true,
                 "oidc_url": self.config.oidc_url,
                 "anchor_enabled": self.config.anchor_enabled,
+                "anchor_interval_secs": self.config.anchor_interval_secs,
+                "rpc_configured": self.config.rpc_url.is_some() && self.config.rpc_user.is_some() && self.config.rpc_pass.is_some(),
             }),
         })
     }

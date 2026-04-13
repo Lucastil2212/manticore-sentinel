@@ -16,7 +16,10 @@ use crate::core::{
     snapshot::SystemSnapshot,
 };
 use crate::models::process::ProcessMetrics;
-use crate::security::audit::{append_event, default_audit_path, now_ts, read_recent, AuditEvent};
+use crate::security::audit::{
+    anchor_audit_if_due, append_event, current_merkle_root, default_audit_path, load_anchor_state,
+    now_ts, read_recent, AnchorConfig, AnchorState, AuditEvent,
+};
 use crate::security::auth::{AuthContext, AuthGate, AuthMode, TokenLifecycle};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
 use crate::utils::time::now_unix_secs;
@@ -108,6 +111,10 @@ pub struct SentinelDashboard {
     active_view: DashboardView,
     token_lifecycle: Option<TokenLifecycle>,
     evrus_jwt: Option<String>,
+    anchor_state: AnchorState,
+    evrus_anchor_config: Option<AnchorConfig>,
+    anchor_interval: Duration,
+    last_anchor_poll: Instant,
 }
 
 impl SentinelDashboard {
@@ -159,9 +166,9 @@ impl SentinelDashboard {
         let socket_path = std::env::temp_dir().join(format!("manticore-sentinel-{}.sock", std::process::id()));
         let helper_mode = cfg.helper_mode.clone();
         let helper = if helper_mode.eq_ignore_ascii_case("subprocess") {
-            HelperRuntime::start_subprocess(socket_path, audit_path, capabilities)?
+            HelperRuntime::start_subprocess(socket_path, audit_path.clone(), capabilities)?
         } else {
-            HelperRuntime::start_embedded(socket_path, audit_path, capabilities)?
+            HelperRuntime::start_embedded(socket_path, audit_path.clone(), capabilities)?
         };
         let auth = AuthContext {
             mode: cfg.auth_mode,
@@ -182,6 +189,23 @@ impl SentinelDashboard {
         );
         let token_lifecycle = cfg.token_lifecycle;
         let evrus_jwt = cfg.connectors.evrus.as_ref().and_then(|ev| ev.jwt.clone());
+        let evrus_anchor_config = cfg.connectors.evrus.as_ref().and_then(|ev| {
+            if !ev.anchor_enabled {
+                return None;
+            }
+            Some(AnchorConfig {
+                rpc_url: ev.rpc_url.clone()?,
+                rpc_user: ev.rpc_user.clone()?,
+                rpc_pass: ev.rpc_pass.clone()?,
+            })
+        });
+        let anchor_interval = cfg
+            .connectors
+            .evrus
+            .as_ref()
+            .map(|ev| Duration::from_secs(ev.anchor_interval_secs))
+            .unwrap_or(Duration::from_secs(300));
+        let anchor_state = load_anchor_state(&audit_path).unwrap_or_default();
 
         let mut engine = SentinelEngine::new();
         engine.init_connectors(&cfg.connectors);
@@ -227,6 +251,10 @@ impl SentinelDashboard {
             active_view: DashboardView::System,
             token_lifecycle,
             evrus_jwt,
+            anchor_state,
+            evrus_anchor_config,
+            anchor_interval,
+            last_anchor_poll: Instant::now() - anchor_interval,
         })
     }
 
@@ -252,6 +280,25 @@ impl SentinelDashboard {
         {
             self.connector_summary = self.engine.poll_connectors();
             self.last_connector_poll = Instant::now();
+        }
+
+        if let Some(anchor_cfg) = &self.evrus_anchor_config {
+            if self.last_anchor_poll.elapsed() >= self.anchor_interval {
+                match anchor_audit_if_due(&self.helper.audit_path, &self.current_actor(), anchor_cfg) {
+                    Ok(Some(state)) => {
+                        self.anchor_state = state;
+                    }
+                    Ok(None) => {
+                        if let Ok(state) = load_anchor_state(&self.helper.audit_path) {
+                            self.anchor_state = state;
+                        }
+                    }
+                    Err(err) => {
+                        self.last_error = Some(format!("audit anchor failed: {err}"));
+                    }
+                }
+                self.last_anchor_poll = Instant::now();
+            }
         }
     }
 
@@ -1184,14 +1231,65 @@ impl SentinelDashboard {
         ));
         ui.label(format!(
             "Evrmore chain height: {}",
-            if anchor_enabled { "pending integration" } else { "anchoring disabled" }
+            if let Some(height) = self.anchor_state.last_anchor_blockheight {
+                height.to_string()
+            } else if anchor_enabled {
+                "awaiting first anchor".to_string()
+            } else {
+                "anchoring disabled".to_string()
+            }
         ));
-        ui.label("Last audit anchor: pending integration");
+        ui.label(format!(
+            "Last audit anchor: {}",
+            self.anchor_state
+                .last_anchor_txid
+                .as_deref()
+                .unwrap_or("none")
+        ));
         ui.label("Policy summary: local execution policy active; EVRUS policy bridge pending");
     }
 
     fn render_audit_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("Audit");
+        let current_merkle = current_merkle_root(&self.helper.audit_path)
+            .ok()
+            .flatten();
+        let anchored_current_window = current_merkle
+            .as_deref()
+            == self.anchor_state.last_anchor_merkle_root.as_deref();
+        ui.label(format!(
+            "Anchored window: {}",
+            if anchored_current_window {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+        ui.label(format!(
+            "Last anchor txid: {}",
+            self.anchor_state
+                .last_anchor_txid
+                .as_deref()
+                .unwrap_or("none")
+        ));
+        ui.label(format!(
+            "Last anchor blockheight: {}",
+            self.anchor_state
+                .last_anchor_blockheight
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        ui.label(format!(
+            "Last anchor timestamp: {}",
+            self.anchor_state
+                .last_anchor_ts
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        if let Some(root) = current_merkle {
+            ui.monospace(format!("Current Merkle root: {root}"));
+        }
+        ui.separator();
         if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
             self.audit_feed = read_recent(&self.helper.audit_path, 32).unwrap_or_default();
             self.last_audit_refresh = Instant::now();
@@ -1202,8 +1300,17 @@ impl SentinelDashboard {
         }
         for event in &self.audit_feed {
             ui.monospace(format!(
-                "[{}] action={} target={} result={} actor={}",
-                event.ts, event.action, event.target, event.result, event.actor
+                "[{}] action={} target={} result={} actor={} policy={} txid={} bh={}",
+                event.ts,
+                event.action,
+                event.target,
+                event.result,
+                event.actor,
+                event.policy_hash.as_deref().unwrap_or("-"),
+                event.anchor_txid.as_deref().unwrap_or("-"),
+                event.anchor_blockheight
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
             ));
         }
     }
@@ -2015,6 +2122,10 @@ fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &s
             result: format!("denied: auth_gate: {reason}"),
             actor: actor.to_string(),
             sig: None,
+            policy_hash: None,
+            anchor_txid: None,
+            anchor_blockheight: None,
+            anchor_merkle_root: None,
         },
     );
 }
@@ -2031,6 +2142,10 @@ fn execute_action(helper: &HelperRuntime, action: CommandAction, actor: &str) ->
                     result: "ok: local read action".to_string(),
                     actor: actor.to_string(),
                     sig: None,
+                    policy_hash: None,
+                    anchor_txid: None,
+                    anchor_blockheight: None,
+                    anchor_merkle_root: None,
                 },
             );
             "Accepted: ShowCpu (local read-only action)".to_string()

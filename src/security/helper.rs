@@ -189,6 +189,10 @@ fn serve(listener: UnixListener, audit_path: PathBuf, capabilities: Vec<Capabili
                         },
                         actor: "operator".to_string(),
                         sig: None,
+                        policy_hash: None,
+                        anchor_txid: None,
+                        anchor_blockheight: None,
+                        anchor_merkle_root: None,
                     },
                 );
                 resp
