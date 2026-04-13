@@ -64,6 +64,18 @@ impl DashboardView {
             DashboardView::Connectors => "Connectors",
         }
     }
+
+    fn help(self) -> &'static str {
+        match self {
+            DashboardView::System => "Overview + control shell + activity feed.",
+            DashboardView::Processes => "Dedicated process inspection with sortable table.",
+            DashboardView::Network => "Focused interface and throughput analysis.",
+            DashboardView::PeerWeave => "PeerWeave connector health and graph context.",
+            DashboardView::Evrus => "EVRUS identity, auth, and anchoring posture.",
+            DashboardView::Audit => "Chronological audit trail with filtering and anchor metadata.",
+            DashboardView::Connectors => "Integration health matrix for all connectors.",
+        }
+    }
 }
 
 fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
@@ -392,6 +404,19 @@ impl SentinelDashboard {
 
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
             ctx.memory_mut(|m| m.request_focus(cmd_focus_id));
+        }
+
+        let alt = ctx.input(|i| i.modifiers.alt);
+        if alt && ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+            self.active_view = DashboardView::System;
+        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num2)) {
+            self.active_view = DashboardView::Processes;
+        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num3)) {
+            self.active_view = DashboardView::Network;
+        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num4)) {
+            self.active_view = DashboardView::Audit;
+        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num5)) {
+            self.active_view = DashboardView::Connectors;
         }
     }
 
@@ -1170,10 +1195,24 @@ impl SentinelDashboard {
     }
 
     fn render_navigation_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("Views (Alt+1..5 quick switch)")
+                .weak()
+                .font(FontId::new(12.0, FontFamily::Proportional)),
+        );
         ui.horizontal_wrapped(|ui| {
             for view in DashboardView::all() {
                 let selected = self.active_view == view;
-                if ui.selectable_label(selected, view.label()).clicked() {
+                let tab = ui
+                    .selectable_label(selected, view.label())
+                    .on_hover_text(view.help());
+                tab.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::SelectableLabel,
+                        format!("Open {} view", view.label()),
+                    )
+                });
+                if tab.clicked() {
                     self.active_view = view;
                 }
             }
@@ -1322,8 +1361,14 @@ impl SentinelDashboard {
     fn render_audit_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("Audit");
         ui.horizontal(|ui| {
-            ui.label("Filter");
-            ui.text_edit_singleline(&mut self.audit_filter);
+            let lbl = ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.audit_filter)
+                    .hint_text("action/target/actor/result")
+                    .desired_width(280.0),
+            )
+            .labelled_by(lbl.id)
+            .on_hover_text("Filter current audit window by text (case-insensitive).");
         });
         let current_merkle = current_merkle_root(&self.helper.audit_path)
             .ok()
@@ -1404,10 +1449,14 @@ impl SentinelDashboard {
         ui.heading("Processes");
         ui.horizontal_wrapped(|ui| {
             ui.label("Sort");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::CpuDesc, "CPU");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::RssDesc, "RSS");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::PidAsc, "PID");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::ThreadsDesc, "Threads");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::CpuDesc, "CPU")
+                .on_hover_text("Highest CPU first.");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::RssDesc, "RSS")
+                .on_hover_text("Largest memory footprint first.");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::PidAsc, "PID")
+                .on_hover_text("PID ascending.");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::ThreadsDesc, "Threads")
+                .on_hover_text("Most threads first.");
         });
         ui.separator();
         let Some(snapshot) = &self.latest else {
