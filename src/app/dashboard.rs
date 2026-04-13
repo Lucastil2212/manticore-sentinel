@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use eframe::egui;
 use egui::{FontFamily, FontId, RichText, Stroke};
 use egui_extras::install_image_loaders;
 use tokio::runtime::Runtime;
-use base64::Engine;
 
 use crate::connectors::ConnectorSummary;
 use crate::core::{
@@ -25,8 +25,8 @@ use crate::security::helper::{send_request, Capability, HelperRequest, HelperRun
 use crate::utils::time::now_unix_secs;
 use tracing::error;
 
-use super::icons;
 use super::event_stream::EventStreamOutput;
+use super::icons;
 
 const ID_COMMAND_INPUT: &str = "command_palette_input";
 
@@ -196,7 +196,8 @@ impl SentinelDashboard {
         };
         let cwd = std::env::current_dir()?;
         let audit_path = default_audit_path(&cwd);
-        let socket_path = std::env::temp_dir().join(format!("manticore-sentinel-{}.sock", std::process::id()));
+        let socket_path =
+            std::env::temp_dir().join(format!("manticore-sentinel-{}.sock", std::process::id()));
         let helper_mode = cfg.helper_mode.clone();
         let helper = if helper_mode.eq_ignore_ascii_case("subprocess") {
             HelperRuntime::start_subprocess(socket_path, audit_path.clone(), capabilities)?
@@ -251,18 +252,15 @@ impl SentinelDashboard {
 
         let policy = ExecutionPolicy::new(auth, ExecutionPolicy::load_evrus_policy());
         let last_policy_hash = policy.current_policy_hash();
-        let event_stream = cfg
-            .event_stream
-            .as_ref()
-            .and_then(|es| {
-                EventStreamOutput::start(
-                    es.port,
-                    cfg.auth_mode,
-                    cfg.auth_token.clone(),
-                    evrus_jwt.clone(),
-                )
-                .ok()
-            });
+        let event_stream = cfg.event_stream.as_ref().and_then(|es| {
+            EventStreamOutput::start(
+                es.port,
+                cfg.auth_mode,
+                cfg.auth_token.clone(),
+                evrus_jwt.clone(),
+            )
+            .ok()
+        });
 
         Ok(Self {
             engine,
@@ -351,7 +349,11 @@ impl SentinelDashboard {
 
         if let Some(anchor_cfg) = &self.evrus_anchor_config {
             if self.last_anchor_poll.elapsed() >= self.anchor_interval {
-                match anchor_audit_if_due(&self.helper.audit_path, &self.current_actor(), anchor_cfg) {
+                match anchor_audit_if_due(
+                    &self.helper.audit_path,
+                    &self.current_actor(),
+                    anchor_cfg,
+                ) {
                     Ok(Some(state)) => {
                         self.anchor_state = state;
                     }
@@ -625,7 +627,9 @@ impl SentinelDashboard {
                     )
                     .wrap(true),
                 )
-                .on_hover_text("Live snapshot: utilization, memory percent of total, and 1/5/15 load.");
+                .on_hover_text(
+                    "Live snapshot: utilization, memory percent of total, and 1/5/15 load.",
+                );
             }
             None => {
                 ui.label(RichText::new("Collecting…").font(body).weak());
@@ -748,22 +752,23 @@ impl SentinelDashboard {
                     );
                     // Single-line TextEdit: Enter must be detected while focused (lost_focus + Enter
                     // often never align in the same frame).
-                    enter_run = ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) && r.has_focus();
+                    enter_run =
+                        ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) && r.has_focus();
                     let run = ui
                         .add_sized(
                             [68.0, 30.0],
-                            egui::Button::new(RichText::new("Run").strong().font(FontId::new(
-                                13.5,
-                                FontFamily::Proportional,
-                            )))
+                            egui::Button::new(
+                                RichText::new("Run")
+                                    .strong()
+                                    .font(FontId::new(13.5, FontFamily::Proportional)),
+                            )
                             .fill(egui::Color32::from_rgb(52, 98, 128))
-                            .stroke(Stroke::new(
-                                1.0,
-                                egui::Color32::from_rgb(72, 118, 148),
-                            )),
+                            .stroke(Stroke::new(1.0, egui::Color32::from_rgb(72, 118, 148))),
                         )
                         .on_hover_text("Run the current line (same as Enter).");
-                    run.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, "Run command"));
+                    run.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, "Run command")
+                    });
                     run_clicked = run.clicked();
                     r
                 });
@@ -775,7 +780,10 @@ impl SentinelDashboard {
                     if ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         self.shell_history_down();
                     }
-                    if ui.ctx().input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.shift) {
+                    if ui
+                        .ctx()
+                        .input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.shift)
+                    {
                         self.shell_tab_complete();
                     }
                 }
@@ -865,10 +873,7 @@ impl SentinelDashboard {
                 .fill(egui::Color32::from_rgb(36, 18, 18))
                 .inner_margin(shell_inset)
                 .rounding(egui::Rounding::same(8.0))
-                .stroke(Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgb(140, 56, 52),
-                ))
+                .stroke(Stroke::new(1.0, egui::Color32::from_rgb(140, 56, 52)))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(
@@ -898,41 +903,42 @@ impl SentinelDashboard {
                         if conf.clicked() {
                             if self.confirm_input.trim() == required {
                                 let action = CommandAction::KillProcess { pid };
-                                self.command_feedback = Some(match self.verify_auth_submission(&action) {
-                                    Err(err) => err,
-                                    Ok(()) => match self.policy.evaluate(&action) {
-                                        Ok(decision) => {
-                                            self.last_policy_hash = decision.policy_hash.clone();
-                                            let output = execute_action(
-                                                &self.helper,
-                                                action.clone(),
-                                                &self.current_actor(),
-                                                self.last_policy_hash.clone(),
-                                            );
-                                            self.policy.record(&action);
-                                            self.record_command_history(&format!("kill {pid}"));
-                                            self.command_input.clear();
-                                            self.history_browse = None;
-                                            self.history_draft.clear();
-                                            output
-                                        }
-                                        Err(err) => {
-                                            audit_policy_denial(
-                                                &self.helper,
-                                                &action,
-                                                &err,
-                                                &self.current_actor(),
-                                                self.policy.current_policy_hash(),
-                                            );
-                                            err
-                                        }
-                                    },
-                                });
+                                self.command_feedback =
+                                    Some(match self.verify_auth_submission(&action) {
+                                        Err(err) => err,
+                                        Ok(()) => match self.policy.evaluate(&action) {
+                                            Ok(decision) => {
+                                                self.last_policy_hash =
+                                                    decision.policy_hash.clone();
+                                                let output = execute_action(
+                                                    &self.helper,
+                                                    action.clone(),
+                                                    &self.current_actor(),
+                                                    self.last_policy_hash.clone(),
+                                                );
+                                                self.policy.record(&action);
+                                                self.record_command_history(&format!("kill {pid}"));
+                                                self.command_input.clear();
+                                                self.history_browse = None;
+                                                self.history_draft.clear();
+                                                output
+                                            }
+                                            Err(err) => {
+                                                audit_policy_denial(
+                                                    &self.helper,
+                                                    &action,
+                                                    &err,
+                                                    &self.current_actor(),
+                                                    self.policy.current_policy_hash(),
+                                                );
+                                                err
+                                            }
+                                        },
+                                    });
                                 self.pending_action = None;
                                 self.confirm_input.clear();
                             } else {
-                                self.command_feedback =
-                                    Some("Confirmation mismatch.".to_string());
+                                self.command_feedback = Some("Confirmation mismatch.".to_string());
                             }
                         }
                         let cancel = ui
@@ -957,8 +963,7 @@ impl SentinelDashboard {
                 let mut info = egui::WidgetInfo::new(egui::WidgetType::Label);
                 info.label = Some(format!("Command result: {msg}"));
                 ctx.output_mut(|o| {
-                    o.events
-                        .push(egui::output::OutputEvent::ValueChanged(info));
+                    o.events.push(egui::output::OutputEvent::ValueChanged(info));
                 });
             }
             let out_stroke = if msg.starts_with("DENIED")
@@ -1020,8 +1025,7 @@ impl SentinelDashboard {
                 .auto_shrink([true, true])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    let entries: Vec<String> =
-                        self.command_history.iter().rev().cloned().collect();
+                    let entries: Vec<String> = self.command_history.iter().rev().cloned().collect();
                     for line in entries {
                         ui.horizontal(|ui| {
                             ui.add(
@@ -1068,8 +1072,11 @@ impl SentinelDashboard {
                 ui.label("Power-user diagnostics and runtime metadata");
             });
             ui.add(
-                egui::Label::new(format!("helper_socket={}", self.helper.socket_path.display()))
-                    .wrap(true),
+                egui::Label::new(format!(
+                    "helper_socket={}",
+                    self.helper.socket_path.display()
+                ))
+                .wrap(true),
             );
             ui.add(
                 egui::Label::new(format!("audit_path={}", self.helper.audit_path.display()))
@@ -1078,14 +1085,15 @@ impl SentinelDashboard {
             ui.monospace(format!("auth_failures={}", self.auth_failures));
             ui.monospace(format!(
                 "auth_lockout_active={}",
-                self.auth_locked_until.map(|t| t > Instant::now()).unwrap_or(false)
+                self.auth_locked_until
+                    .map(|t| t > Instant::now())
+                    .unwrap_or(false)
             ));
-            ui.add(
-                egui::Label::new(format!("runtime={}", self.runtime_diagnostics)).wrap(true),
-            );
+            ui.add(egui::Label::new(format!("runtime={}", self.runtime_diagnostics)).wrap(true));
         });
-        adv.header_response
-            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, "Advanced Controls"));
+        adv.header_response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, "Advanced Controls")
+        });
     }
 
     fn render_control_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1094,9 +1102,7 @@ impl SentinelDashboard {
             icons::paint(ui, "section-command", icons::COMMAND, 18.0);
             ui.heading("Control");
         });
-        ui.label(
-            egui::RichText::new("Operator shell, auth, and block-style output.").weak(),
-        );
+        ui.label(egui::RichText::new("Operator shell, auth, and block-style output.").weak());
         ui.add_space(8.0);
         self.render_command_workbench(ui, ctx);
     }
@@ -1107,9 +1113,7 @@ impl SentinelDashboard {
             icons::paint(ui, "section-activity", icons::AUDIT, 18.0);
             ui.heading("Activity");
         });
-        ui.label(
-            egui::RichText::new("Top processes and append-only audit trail.").weak(),
-        );
+        ui.label(egui::RichText::new("Top processes and append-only audit trail.").weak());
         ui.add_space(8.0);
         self.render_activity_panels(ui, snapshot);
     }
@@ -1117,7 +1121,7 @@ impl SentinelDashboard {
     fn render_activity_panels(&mut self, ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "command-process", icons::COMMAND, 14.0);
+            icons::paint(ui, "command-process", icons::PROCESS, 14.0);
             ui.heading("Top Processes (CPU)")
                 .on_hover_text("Highest CPU consumers in current snapshot.");
         });
@@ -1142,9 +1146,11 @@ impl SentinelDashboard {
         }
         if self.audit_feed.is_empty() {
             ui.label(
-                egui::RichText::new("No audit events recorded yet. Helper actions and auth denials appear here.")
-                    .weak()
-                    .italics(),
+                egui::RichText::new(
+                    "No audit events recorded yet. Helper actions and auth denials appear here.",
+                )
+                .weak()
+                .italics(),
             );
         } else {
             for event in &self.audit_feed {
@@ -1162,10 +1168,7 @@ impl SentinelDashboard {
             icons::paint(ui, "connectors-network", icons::NETWORK, 18.0);
             ui.heading("Ecosystem Connectors");
         });
-        ui.label(
-            egui::RichText::new("PeerWeave and EVRUS integration status.")
-                .weak(),
-        );
+        ui.label(egui::RichText::new("PeerWeave and EVRUS integration status.").weak());
         ui.add_space(8.0);
 
         if self.connector_summary.entries.is_empty() {
@@ -1298,8 +1301,12 @@ impl SentinelDashboard {
         ui.label(
             RichText::new(format!(
                 "Node: {}  |  Status: {}  |  Uptime: {}s",
-                node.get("peerId").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                node.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                node.get("peerId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                node.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
                 node.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0)
             ))
             .strong(),
@@ -1321,7 +1328,10 @@ impl SentinelDashboard {
                 ui.label("No spaces returned.");
             } else {
                 for space in spaces.iter().take(16) {
-                    let name = space.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                    let name = space
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unnamed");
                     let sync = space
                         .get("syncState")
                         .and_then(|v| v.as_str())
@@ -1358,7 +1368,10 @@ impl SentinelDashboard {
 
         if let Some(jwt) = self.evrus_jwt.as_deref() {
             if let Some(identity) = parse_identity_from_jwt(jwt) {
-                ui.label(format!("Operator DID: {}", identity.did.unwrap_or_else(|| "unknown".into())));
+                ui.label(format!(
+                    "Operator DID: {}",
+                    identity.did.unwrap_or_else(|| "unknown".into())
+                ));
                 ui.label(format!(
                     "Display name: {}",
                     identity.display_name.unwrap_or_else(|| "unknown".into())
@@ -1420,19 +1433,12 @@ impl SentinelDashboard {
             .labelled_by(lbl.id)
             .on_hover_text("Filter current audit window by text (case-insensitive).");
         });
-        let current_merkle = current_merkle_root(&self.helper.audit_path)
-            .ok()
-            .flatten();
-        let anchored_current_window = current_merkle
-            .as_deref()
-            == self.anchor_state.last_anchor_merkle_root.as_deref();
+        let current_merkle = current_merkle_root(&self.helper.audit_path).ok().flatten();
+        let anchored_current_window =
+            current_merkle.as_deref() == self.anchor_state.last_anchor_merkle_root.as_deref();
         ui.label(format!(
             "Anchored window: {}",
-            if anchored_current_window {
-                "yes"
-            } else {
-                "no"
-            }
+            if anchored_current_window { "yes" } else { "no" }
         ));
         ui.label(format!(
             "Last anchor txid: {}",
@@ -1488,7 +1494,8 @@ impl SentinelDashboard {
                 event.actor,
                 event.policy_hash.as_deref().unwrap_or("-"),
                 event.anchor_txid.as_deref().unwrap_or("-"),
-                event.anchor_blockheight
+                event
+                    .anchor_blockheight
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "-".to_string())
             ));
@@ -1496,7 +1503,15 @@ impl SentinelDashboard {
     }
 
     fn render_processes_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Processes");
+        ui.horizontal_wrapped(|ui| {
+            icons::paint(ui, "process-view", icons::PROCESS, 18.0);
+            ui.heading("Processes");
+        });
+        ui.label(
+            egui::RichText::new("Sortable process inspection by CPU, RSS, PID, and thread count.")
+                .weak(),
+        );
+        ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.label("Sort");
             ui.selectable_value(&mut self.process_sort, ProcessSort::CpuDesc, "CPU")
@@ -1547,10 +1562,7 @@ impl SentinelDashboard {
             icons::paint(ui, "overview-radar", icons::RADAR, 18.0);
             ui.heading("Overview");
         });
-        ui.label(
-            egui::RichText::new("CPU, memory, disk, and network at a glance.")
-                .weak(),
-        );
+        ui.label(egui::RichText::new("CPU, memory, disk, and network at a glance.").weak());
         ui.add_space(8.0);
         self.render_overview_quick_tiles(ui);
         ui.add_space(8.0);
@@ -1989,10 +2001,7 @@ fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
             );
             ui.vertical(|ui| {
                 ui.set_width(name_w);
-                ui.add(
-                    egui::Label::new(egui::RichText::new(process.name.as_str()))
-                        .wrap(true),
-                );
+                ui.add(egui::Label::new(egui::RichText::new(process.name.as_str())).wrap(true));
             });
             ui.add_sized(
                 [CPU_W, 20.0],
@@ -2002,10 +2011,7 @@ fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
                 [RSS_W, 20.0],
                 egui::Label::new(human_bytes(process.memory_bytes)).wrap(false),
             );
-            ui.add_sized(
-                [THR_W, 20.0],
-                egui::Label::new(process.threads.to_string()),
-            );
+            ui.add_sized([THR_W, 20.0], egui::Label::new(process.threads.to_string()));
         });
         ui.add_space(4.0);
     }
@@ -2110,7 +2116,9 @@ fn cpu_overview_extras(ui: &mut egui::Ui, cpu: &crate::models::cpu::CpuMetrics) 
         .weak()
         .font(FontId::new(12.5, FontFamily::Proportional)),
     )
-    .on_hover_text("Instantaneous per-core utilization since the last sample; aggregate can differ slightly.");
+    .on_hover_text(
+        "Instantaneous per-core utilization since the last sample; aggregate can differ slightly.",
+    );
 }
 
 fn memory_overview_extras(ui: &mut egui::Ui, m: &crate::models::memory::MemoryMetrics) {
@@ -2147,12 +2155,22 @@ fn memory_overview_extras(ui: &mut egui::Ui, m: &crate::models::memory::MemoryMe
     );
 }
 
-fn throughput_panel_heading(ui: &mut egui::Ui, icon_key: &str, icon_bytes: &'static [u8], title: &str, tip: &str) {
+fn throughput_panel_heading(
+    ui: &mut egui::Ui,
+    icon_key: &str,
+    icon_bytes: &'static [u8],
+    title: &str,
+    tip: &str,
+) {
     ui.horizontal_top(|ui| {
         icons::paint(ui, icon_key, icon_bytes, 18.0);
         ui.add(
-            egui::Label::new(RichText::new(title).strong().font(FontId::new(14.0, FontFamily::Proportional)))
-                .wrap(true),
+            egui::Label::new(
+                RichText::new(title)
+                    .strong()
+                    .font(FontId::new(14.0, FontFamily::Proportional)),
+            )
+            .wrap(true),
         )
         .on_hover_text(tip);
     });
@@ -2221,8 +2239,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                         .fill(cpu_util_fill(mem_pct as f32)),
                 );
                 pb.widget_info(|| {
-                    let mut info =
-                        egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator);
+                    let mut info = egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator);
                     info.label = Some(format!("Memory usage {mem_pct} percent"));
                     info
                 });
@@ -2237,8 +2254,10 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width());
                     icons::paint(ui, "cpu-panel", icons::CPU, 16.0);
-                    ui.label(RichText::new("CPU").font(FontId::new(13.0, FontFamily::Proportional)))
-                        .on_hover_text("Current aggregate processor utilization and load.");
+                    ui.label(
+                        RichText::new("CPU").font(FontId::new(13.0, FontFamily::Proportional)),
+                    )
+                    .on_hover_text("Current aggregate processor utilization and load.");
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!("{:.2}%", snapshot.cpu.usage_percent))
@@ -2259,8 +2278,10 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width());
                     icons::paint(ui, "memory", icons::MEMORY, 16.0);
-                    ui.label(RichText::new("Memory").font(FontId::new(13.0, FontFamily::Proportional)))
-                        .on_hover_text("Memory available for new programs (approx.) versus total RAM.");
+                    ui.label(
+                        RichText::new("Memory").font(FontId::new(13.0, FontFamily::Proportional)),
+                    )
+                    .on_hover_text("Memory available for new programs (approx.) versus total RAM.");
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!(
@@ -2287,8 +2308,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                             .fill(cpu_util_fill(mem_pct as f32)),
                     );
                     pb.widget_info(|| {
-                        let mut info =
-                            egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator);
+                        let mut info = egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator);
                         info.label = Some(format!("Memory usage {mem_pct} percent"));
                         info
                     });
@@ -2454,7 +2474,11 @@ fn execute_action(
                 nice: None,
             };
             match send_request(&helper.socket_path, &req) {
-                Ok(resp) => format!("{}: {}", if resp.ok { "OK" } else { "DENIED" }, resp.message),
+                Ok(resp) => format!(
+                    "{}: {}",
+                    if resp.ok { "OK" } else { "DENIED" },
+                    resp.message
+                ),
                 Err(err) => format!("Helper error: {err}"),
             }
         }
@@ -2465,7 +2489,11 @@ fn execute_action(
                 nice: Some(nice),
             };
             match send_request(&helper.socket_path, &req) {
-                Ok(resp) => format!("{}: {}", if resp.ok { "OK" } else { "DENIED" }, resp.message),
+                Ok(resp) => format!(
+                    "{}: {}",
+                    if resp.ok { "OK" } else { "DENIED" },
+                    resp.message
+                ),
                 Err(err) => format!("Helper error: {err}"),
             }
         }
@@ -2551,12 +2579,14 @@ fn apply_security_visuals(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 6.0);
         style.spacing.window_margin = egui::Margin::same(12.0);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, FontId::new(12.5, FontFamily::Proportional));
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            FontId::new(14.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            FontId::new(12.5, FontFamily::Proportional),
+        );
     });
 }
 

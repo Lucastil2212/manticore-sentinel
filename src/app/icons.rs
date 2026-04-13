@@ -9,6 +9,7 @@ pub const CPU: &[u8] = include_bytes!("../../assets/icons/icon-cpu.svg");
 pub const MEMORY: &[u8] = include_bytes!("../../assets/icons/icon-memory.svg");
 pub const DISK: &[u8] = include_bytes!("../../assets/icons/icon-disk.svg");
 pub const NETWORK: &[u8] = include_bytes!("../../assets/icons/icon-network.svg");
+pub const PROCESS: &[u8] = include_bytes!("../../assets/icons/icon-process.svg");
 pub const COMMAND: &[u8] = include_bytes!("../../assets/icons/icon-command.svg");
 pub const AUDIT: &[u8] = include_bytes!("../../assets/icons/icon-audit.svg");
 pub const SETTINGS: &[u8] = include_bytes!("../../assets/icons/icon-settings.svg");
