@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum AuthMode {
     Local,
     Token,
+    Evrus,
 }
 
 impl AuthMode {
@@ -12,6 +13,7 @@ impl AuthMode {
         match self {
             AuthMode::Local => "local",
             AuthMode::Token => "token",
+            AuthMode::Evrus => "evrus",
         }
     }
 
@@ -19,6 +21,7 @@ impl AuthMode {
         match raw.to_ascii_lowercase().as_str() {
             "local" => Some(AuthMode::Local),
             "token" => Some(AuthMode::Token),
+            "evrus" => Some(AuthMode::Evrus),
             _ => None,
         }
     }

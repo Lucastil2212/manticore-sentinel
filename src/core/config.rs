@@ -50,7 +50,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     let auth_mode_raw = std::env::var("MANTICORE_AUTH_MODE").unwrap_or_else(|_| "local".to_string());
     let auth_mode = AuthMode::from_env(&auth_mode_raw).ok_or_else(|| {
         anyhow::anyhow!(
-            "invalid MANTICORE_AUTH_MODE '{}', expected local|token",
+            "invalid MANTICORE_AUTH_MODE '{}', expected local|token|evrus",
             auth_mode_raw
         )
     })?;
@@ -124,6 +124,17 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     }
 
     let connectors = load_connector_config();
+    if auth_mode == AuthMode::Evrus {
+        let evrus = connectors
+            .evrus
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("MANTICORE_AUTH_MODE=evrus requires EVRUS connector enabled"))?;
+        if evrus.jwt.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "MANTICORE_AUTH_MODE=evrus requires MANTICORE_EVRUS_JWT"
+            ));
+        }
+    }
 
     Ok(RuntimeConfig {
         profile,

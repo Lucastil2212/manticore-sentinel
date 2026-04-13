@@ -14,6 +14,10 @@ Profiles are loaded from `config/profiles/<name>.env`.
 - `secure`
   - `MANTICORE_PRIVILEGED=true`
   - `MANTICORE_HELPER_MODE=subprocess`
+- `ecosystem`
+  - `MANTICORE_AUTH_MODE=evrus`
+  - PeerWeave + EVRUS connectors enabled
+  - Evrmore audit anchoring enabled (RPC credentials required)
 
 ## Examples
 
@@ -21,8 +25,11 @@ Profiles are loaded from `config/profiles/<name>.env`.
   - `cargo run -- --profile dev`
 - Secure profile:
   - `cargo run -- --profile secure`
+- Ecosystem profile:
+  - `cargo run -- --profile ecosystem`
 
 ## Notes
 
 - Explicit environment variables in your shell can still override behavior if set after profile loading.
 - Profile files are plain key-value env declarations with `#` comments supported.
+- `ecosystem` profile includes placeholder secrets/tokens; replace before use.
