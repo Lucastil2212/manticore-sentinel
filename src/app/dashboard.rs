@@ -111,6 +111,38 @@ pub struct SentinelDashboard {
 }
 
 impl SentinelDashboard {
+    fn current_actor(&self) -> String {
+        self.evrus_jwt
+            .as_deref()
+            .and_then(parse_identity_from_jwt)
+            .and_then(|identity| identity.did)
+            .unwrap_or_else(|| "operator".to_string())
+    }
+
+    fn trust_badge_text(&self) -> String {
+        let role = self.role_label.to_ascii_uppercase();
+        let Some(_health) = self.connector_health_for("EVRUS") else {
+            return format!("LOCAL · {role}");
+        };
+        let did = self
+            .evrus_jwt
+            .as_deref()
+            .and_then(parse_identity_from_jwt)
+            .and_then(|identity| identity.did)
+            .unwrap_or_else(|| "unknown-did".to_string());
+        let anchor_enabled = self
+            .connector_summary
+            .snapshot_for("EVRUS")
+            .and_then(|s| s.data.get("anchor_enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if anchor_enabled {
+            format!("EVRUS · ANCHORED · {role}")
+        } else {
+            format!("EVRUS · {did} · {role}")
+        }
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let cfg = load_runtime_config()?;
         let allow_privileged = cfg.privileged;
@@ -228,7 +260,7 @@ impl SentinelDashboard {
             if Instant::now() < until {
                 let remaining = until.saturating_duration_since(Instant::now()).as_secs();
                 let reason = format!("authentication locked: retry in {}s", remaining.max(1));
-                audit_auth_failure(&self.helper, action, &reason);
+                audit_auth_failure(&self.helper, action, &reason, &self.current_actor());
                 return Err(reason);
             }
             self.auth_locked_until = None;
@@ -248,7 +280,7 @@ impl SentinelDashboard {
                     let lock_secs = ((self.auth_failures - 2) * 10).min(60) as u64;
                     self.auth_locked_until = Some(Instant::now() + Duration::from_secs(lock_secs));
                 }
-                audit_auth_failure(&self.helper, action, &err);
+                audit_auth_failure(&self.helper, action, &err, &self.current_actor());
                 Err(err)
             }
         }
@@ -302,7 +334,8 @@ impl SentinelDashboard {
                     match self.policy.evaluate(&action) {
                         Err(err) => (err, false),
                         Ok(()) => {
-                            let output = execute_action(&self.helper, action.clone());
+                            let output =
+                                execute_action(&self.helper, action.clone(), &self.current_actor());
                             self.policy.record(&action);
                             (output, true)
                         }
@@ -688,7 +721,11 @@ impl SentinelDashboard {
                                     Err(err) => err,
                                     Ok(()) => match self.policy.evaluate(&action) {
                                         Ok(()) => {
-                                            let output = execute_action(&self.helper, action.clone());
+                                            let output = execute_action(
+                                                &self.helper,
+                                                action.clone(),
+                                                &self.current_actor(),
+                                            );
                                             self.policy.record(&action);
                                             self.record_command_history(&format!("kill {pid}"));
                                             self.command_input.clear();
@@ -1274,8 +1311,9 @@ impl eframe::App for SentinelDashboard {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
-                                    "Mode: OPERATOR  ·  Trust: {}  ·  Role: {}  ·  Auth: {}  ·  Audit: APPEND-ONLY",
-                                    self.trust_state, self.role_label, self.auth_mode_label
+                                    "Mode: OPERATOR  ·  Trust: {}  ·  Auth: {}  ·  Audit: APPEND-ONLY",
+                                    self.trust_badge_text(),
+                                    self.auth_mode_label
                                 ))
                                 .font(FontId::new(13.5, FontFamily::Proportional)),
                             )
@@ -1962,7 +2000,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
     }
 }
 
-fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &str) {
+fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &str, actor: &str) {
     let (action_name, target) = match action {
         CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
         CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
@@ -1975,12 +2013,12 @@ fn audit_auth_failure(helper: &HelperRuntime, action: &CommandAction, reason: &s
             action: action_name.to_string(),
             target,
             result: format!("denied: auth_gate: {reason}"),
-            actor: "operator".to_string(),
+                    actor: actor.to_string(),
         },
     );
 }
 
-fn execute_action(helper: &HelperRuntime, action: CommandAction) -> String {
+fn execute_action(helper: &HelperRuntime, action: CommandAction, actor: &str) -> String {
     match action {
         CommandAction::ShowCpu => {
             let _ = append_event(
@@ -1990,7 +2028,7 @@ fn execute_action(helper: &HelperRuntime, action: CommandAction) -> String {
                     action: "show_cpu".to_string(),
                     target: "system".to_string(),
                     result: "ok: local read action".to_string(),
-                    actor: "operator".to_string(),
+                    actor: actor.to_string(),
                 },
             );
             "Accepted: ShowCpu (local read-only action)".to_string()
