@@ -51,6 +51,15 @@ pub fn default_audit_path(root: &Path) -> PathBuf {
 }
 
 pub fn append_event(path: &Path, event: &AuditEvent) -> anyhow::Result<()> {
+    append_event_with_retention(path, event, 0, false)
+}
+
+pub fn append_event_with_retention(
+    path: &Path,
+    event: &AuditEvent,
+    max_entries: usize,
+    archive_enabled: bool,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -64,7 +73,89 @@ pub fn append_event(path: &Path, event: &AuditEvent) -> anyhow::Result<()> {
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
     file.flush()?;
+    drop(file);
+
+    let _ = update_merkle_state_incremental_from_signed(path, &signed_event);
+
+    if max_entries > 0 {
+        enforce_audit_retention(path, max_entries, archive_enabled)?;
+    }
     Ok(())
+}
+
+fn enforce_audit_retention(
+    path: &Path,
+    max_entries: usize,
+    archive_enabled: bool,
+) -> anyhow::Result<()> {
+    let raw = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= max_entries {
+        return Ok(());
+    }
+    let keep_from = lines.len() - max_entries;
+    let overflow = &lines[..keep_from];
+
+    if archive_enabled {
+        let archive_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("archive");
+        fs::create_dir_all(&archive_dir)?;
+        let ts = now_ts();
+        let archive_name = format!("events-{ts}.jsonl");
+        let archive_path = archive_dir.join(archive_name);
+        let mut af = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&archive_path)?;
+        for line in overflow {
+            af.write_all(line.as_bytes())?;
+            af.write_all(b"\n")?;
+        }
+        af.flush()?;
+    }
+
+    let kept = &lines[keep_from..];
+    let mut content = kept.join("\n");
+    content.push('\n');
+    fs::write(path, content)?;
+    Ok(())
+}
+
+pub fn audit_entry_count(path: &Path) -> usize {
+    match fs::read_to_string(path) {
+        Ok(raw) => raw.lines().filter(|l| !l.trim().is_empty()).count(),
+        Err(_) => 0,
+    }
+}
+
+pub fn audit_archive_stats(audit_path: &Path) -> (usize, u64) {
+    let archive_dir = audit_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("archive");
+    let mut count = 0usize;
+    let mut total_bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(&archive_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "jsonl")
+                .unwrap_or(false)
+            {
+                count += 1;
+                total_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (count, total_bytes)
 }
 
 fn signing_key_path(audit_path: &Path) -> PathBuf {
@@ -164,9 +255,39 @@ pub fn read_from_offset(path: &Path, offset: usize) -> anyhow::Result<(Vec<Audit
     Ok((events, lines.len()))
 }
 
-pub fn current_merkle_root(path: &Path) -> anyhow::Result<Option<String>> {
-    let raw = fs::read_to_string(path).unwrap_or_default();
-    let mut leaves: Vec<[u8; 32]> = Vec::new();
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MerkleState {
+    pub leaf_count: usize,
+    pub leaves: Vec<String>,
+}
+
+fn merkle_state_path(audit_path: &Path) -> PathBuf {
+    audit_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("merkle_state.json")
+}
+
+pub fn load_merkle_state(audit_path: &Path) -> MerkleState {
+    let path = merkle_state_path(audit_path);
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => MerkleState::default(),
+    }
+}
+
+fn save_merkle_state(audit_path: &Path, state: &MerkleState) -> anyhow::Result<()> {
+    let path = merkle_state_path(audit_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string(state)?)?;
+    Ok(())
+}
+
+pub fn rebuild_merkle_state(audit_path: &Path) -> anyhow::Result<MerkleState> {
+    let raw = fs::read_to_string(audit_path).unwrap_or_default();
+    let mut leaves = Vec::new();
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -174,12 +295,48 @@ pub fn current_merkle_root(path: &Path) -> anyhow::Result<Option<String>> {
         let canonical = canonicalize_json(&value);
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
-        leaves.push(hasher.finalize().into());
+        leaves.push(hex_bytes(hasher.finalize().into()));
     }
-    if leaves.is_empty() {
-        return Ok(None);
+    let state = MerkleState {
+        leaf_count: leaves.len(),
+        leaves,
+    };
+    save_merkle_state(audit_path, &state)?;
+    Ok(state)
+}
+
+fn update_merkle_state_incremental_from_signed(
+    audit_path: &Path,
+    signed_event: &AuditEvent,
+) -> anyhow::Result<MerkleState> {
+    let mut state = load_merkle_state(audit_path);
+    let value = serde_json::to_value(signed_event)?;
+    let canonical = canonicalize_json(&value);
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let leaf = hex_bytes(hasher.finalize().into());
+    state.leaves.push(leaf);
+    state.leaf_count = state.leaves.len();
+    save_merkle_state(audit_path, &state)?;
+    Ok(state)
+}
+
+pub fn merkle_root_from_state(state: &MerkleState) -> Option<String> {
+    if state.leaves.is_empty() {
+        return None;
     }
-    let mut level = leaves;
+    let mut level: Vec<[u8; 32]> = state
+        .leaves
+        .iter()
+        .map(|hex| {
+            let mut buf = [0u8; 32];
+            for (i, chunk) in hex.as_bytes().chunks(2).enumerate().take(32) {
+                buf[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16)
+                    .unwrap_or(0);
+            }
+            buf
+        })
+        .collect();
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0usize;
@@ -198,7 +355,21 @@ pub fn current_merkle_root(path: &Path) -> anyhow::Result<Option<String>> {
         }
         level = next;
     }
-    Ok(Some(hex_bytes(level[0])))
+    Some(hex_bytes(level[0]))
+}
+
+pub fn current_merkle_root(path: &Path) -> anyhow::Result<Option<String>> {
+    let state = load_merkle_state(path);
+    if state.leaves.is_empty() {
+        let rebuilt = rebuild_merkle_state(path)?;
+        return Ok(merkle_root_from_state(&rebuilt));
+    }
+    let entry_count = audit_entry_count(path);
+    if entry_count != state.leaf_count {
+        let rebuilt = rebuild_merkle_state(path)?;
+        return Ok(merkle_root_from_state(&rebuilt));
+    }
+    Ok(merkle_root_from_state(&state))
 }
 
 pub fn load_anchor_state(audit_path: &Path) -> anyhow::Result<AnchorState> {
@@ -384,26 +555,26 @@ pub fn now_ts() -> u64 {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{append_event, read_recent, AuditEvent};
+    use super::{
+        append_event, append_event_with_retention, audit_archive_stats, audit_entry_count,
+        merkle_root_from_state, read_recent, rebuild_merkle_state, AuditEvent,
+    };
 
     fn temp_audit_file(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "manticore-audit-test-{}-{}.jsonl",
+        let dir = std::env::temp_dir().join(format!(
+            "manticore-audit-test-{}-{}",
             std::process::id(),
             name
         ));
-        let _ = fs::remove_file(&p);
-        p
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        dir.join("events.jsonl")
     }
 
-    #[test]
-    fn append_and_read_recent_events() {
-        let path = temp_audit_file("append-read");
-
-        let e1 = AuditEvent {
-            ts: 1,
-            action: "show_cpu".to_string(),
+    fn sample_event(ts: u64) -> AuditEvent {
+        AuditEvent {
+            ts,
+            action: "test_action".to_string(),
             target: "system".to_string(),
             result: "ok".to_string(),
             actor: "tester".to_string(),
@@ -412,18 +583,20 @@ mod tests {
             anchor_txid: None,
             anchor_blockheight: None,
             anchor_merkle_root: None,
-        };
+        }
+    }
+
+    #[test]
+    fn append_and_read_recent_events() {
+        let path = temp_audit_file("append-read");
+
+        let e1 = sample_event(1);
         let e2 = AuditEvent {
             ts: 2,
             action: "kill_process".to_string(),
             target: "pid:123".to_string(),
             result: "denied".to_string(),
-            actor: "tester".to_string(),
-            sig: None,
-            policy_hash: None,
-            anchor_txid: None,
-            anchor_blockheight: None,
-            anchor_merkle_root: None,
+            ..sample_event(2)
         };
 
         append_event(&path, &e1).expect("append first");
@@ -436,6 +609,67 @@ mod tests {
         assert!(recent[0].sig.is_some());
         assert!(recent[1].sig.is_some());
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn audit_rotation_trims_and_archives() {
+        let path = temp_audit_file("rotation");
+
+        for i in 0..10 {
+            append_event_with_retention(&path, &sample_event(i), 5, true)
+                .expect("append with retention");
+        }
+
+        assert_eq!(audit_entry_count(&path), 5);
+        let recent = read_recent(&path, 10).unwrap();
+        assert!(recent.iter().all(|e| e.ts >= 5));
+
+        let (count, bytes) = audit_archive_stats(&path);
+        assert!(count >= 1, "should have at least one archive file");
+        assert!(bytes > 0, "archive should have content");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn audit_rotation_without_archive_discards() {
+        let path = temp_audit_file("rotation-no-archive");
+
+        for i in 0..8 {
+            append_event_with_retention(&path, &sample_event(i), 4, false)
+                .expect("append without archive");
+        }
+
+        assert_eq!(audit_entry_count(&path), 4);
+        let recent = read_recent(&path, 10).unwrap();
+        assert!(recent.iter().all(|e| e.ts >= 4));
+
+        let (count, _) = audit_archive_stats(&path);
+        assert_eq!(count, 0, "no archives when archiving is disabled");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn incremental_merkle_matches_full_rebuild() {
+        let path = temp_audit_file("merkle-incremental");
+
+        let events: Vec<AuditEvent> = (0..5).map(sample_event).collect();
+        for e in &events {
+            append_event_with_retention(&path, e, 0, false).expect("append");
+        }
+
+        let incremental_state = super::load_merkle_state(&path);
+        assert_eq!(incremental_state.leaf_count, 5);
+
+        let rebuilt_state = rebuild_merkle_state(&path).expect("rebuild");
+
+        let root_inc = merkle_root_from_state(&incremental_state);
+        let root_full = merkle_root_from_state(&rebuilt_state);
+        assert_eq!(root_inc, root_full);
+        assert!(root_inc.is_some());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

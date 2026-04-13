@@ -28,6 +28,12 @@ pub struct ConnectorConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct AuditRetentionConfig {
+    pub max_entries: usize,
+    pub archive_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub profile: String,
     pub privileged: bool,
@@ -40,6 +46,14 @@ pub struct RuntimeConfig {
     pub connectors: ConnectorConfig,
     pub event_stream: Option<EventStreamConfig>,
     pub snapshot_history: SnapshotHistoryConfig,
+    pub audit_retention: AuditRetentionConfig,
+    pub config_warnings: Vec<ConfigWarning>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigWarning {
+    pub area: &'static str,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +68,7 @@ pub struct SnapshotHistoryConfig {
 }
 
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
+    let mut warnings: Vec<ConfigWarning> = Vec::new();
     let profile = std::env::var("MANTICORE_PROFILE").unwrap_or_else(|_| "default".to_string());
     let privileged = parse_bool_env("MANTICORE_PRIVILEGED", false)?;
     let helper_mode =
@@ -156,10 +171,22 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     }
 
     let event_stream = if parse_bool_env("MANTICORE_EVENT_STREAM_ENABLED", false).unwrap_or(false) {
-        let port = std::env::var("MANTICORE_EVENT_STREAM_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(9462);
+        let port = match std::env::var("MANTICORE_EVENT_STREAM_PORT") {
+            Ok(v) => match v.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => {
+                    warnings.push(ConfigWarning {
+                        area: "SSE",
+                        message: format!(
+                            "MANTICORE_EVENT_STREAM_PORT '{}' is not a valid port, using default 9462",
+                            v
+                        ),
+                    });
+                    9462
+                }
+            },
+            Err(_) => 9462,
+        };
         Some(EventStreamConfig { port })
     } else {
         None
@@ -171,6 +198,19 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(5000)
             .clamp(100, 200_000),
+    };
+    let audit_retention = {
+        let max_entries = std::env::var("MANTICORE_AUDIT_MAX_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10_000)
+            .clamp(500, 500_000);
+        let archive_enabled =
+            parse_bool_env("MANTICORE_AUDIT_ARCHIVE_ENABLED", true).unwrap_or(true);
+        AuditRetentionConfig {
+            max_entries,
+            archive_enabled,
+        }
     };
 
     Ok(RuntimeConfig {
@@ -185,6 +225,8 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         connectors,
         event_stream,
         snapshot_history,
+        audit_retention,
+        config_warnings: warnings,
     })
 }
 

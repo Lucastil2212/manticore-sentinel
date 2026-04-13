@@ -17,9 +17,11 @@ use crate::core::{
     snapshot::SystemSnapshot,
 };
 use crate::models::process::ProcessMetrics;
+use crate::core::config::{AuditRetentionConfig, ConfigWarning};
 use crate::security::audit::{
-    anchor_audit_if_due, append_event, current_merkle_root, default_audit_path, load_anchor_state,
-    now_ts, read_from_offset, read_recent, AnchorConfig, AnchorState, AuditEvent,
+    anchor_audit_if_due, append_event_with_retention, audit_archive_stats, audit_entry_count,
+    current_merkle_root, default_audit_path, load_anchor_state, now_ts, read_from_offset,
+    read_recent, AnchorConfig, AnchorState, AuditEvent,
 };
 use crate::security::auth::{AuthContext, AuthGate, AuthMode, TokenLifecycle};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
@@ -147,6 +149,9 @@ pub struct SentinelDashboard {
     snapshot_history_recent_hour: usize,
     last_snapshot_history_probe: Instant,
     latest_alerts: Vec<AlertMatch>,
+    audit_retention: AuditRetentionConfig,
+    config_warnings: Vec<ConfigWarning>,
+    config_warnings_dismissed: bool,
     self_collect_last_ms: f64,
     self_collect_avg_ms: f64,
     self_collect_cycles: u64,
@@ -267,6 +272,13 @@ impl SentinelDashboard {
 
         let policy = ExecutionPolicy::new(auth, ExecutionPolicy::load_evrus_policy());
         let last_policy_hash = policy.current_policy_hash();
+        let mut all_warnings = cfg.config_warnings.clone();
+        for pw in ExecutionPolicy::policy_load_warnings() {
+            all_warnings.push(ConfigWarning {
+                area: "Policy",
+                message: pw,
+            });
+        }
         let event_stream = cfg.event_stream.as_ref().and_then(|es| {
             EventStreamOutput::start(
                 es.port,
@@ -328,6 +340,9 @@ impl SentinelDashboard {
             snapshot_history_recent_hour: 0,
             last_snapshot_history_probe: Instant::now() - Duration::from_secs(10),
             latest_alerts: Vec::new(),
+            audit_retention: cfg.audit_retention.clone(),
+            config_warnings: all_warnings,
+            config_warnings_dismissed: false,
             self_collect_last_ms: 0.0,
             self_collect_avg_ms: 0.0,
             self_collect_cycles: 0,
@@ -471,6 +486,7 @@ impl SentinelDashboard {
                     &reason,
                     &self.current_actor(),
                     self.last_policy_hash.clone(),
+                    &self.audit_retention,
                 );
                 return Err(reason);
             }
@@ -497,6 +513,7 @@ impl SentinelDashboard {
                     &err,
                     &self.current_actor(),
                     self.last_policy_hash.clone(),
+                    &self.audit_retention,
                 );
                 Err(err)
             }
@@ -558,6 +575,7 @@ impl SentinelDashboard {
                                 &err,
                                 &self.current_actor(),
                                 self.policy.current_policy_hash(),
+                                &self.audit_retention,
                             );
                             (err, false)
                         }
@@ -579,6 +597,7 @@ impl SentinelDashboard {
                                 &err,
                                 &self.current_actor(),
                                 self.policy.current_policy_hash(),
+                                &self.audit_retention,
                             );
                             (err, false)
                         }
@@ -589,6 +608,7 @@ impl SentinelDashboard {
                                 action.clone(),
                                 &self.current_actor(),
                                 self.last_policy_hash.clone(),
+                                &self.audit_retention,
                             );
                             self.policy.record(&action);
                             (output, true)
@@ -986,6 +1006,7 @@ impl SentinelDashboard {
                                                     action.clone(),
                                                     &self.current_actor(),
                                                     self.last_policy_hash.clone(),
+                                                    &self.audit_retention,
                                                 );
                                                 self.policy.record(&action);
                                                 self.record_command_history(&format!("kill {pid}"));
@@ -1001,6 +1022,7 @@ impl SentinelDashboard {
                                                     &err,
                                                     &self.current_actor(),
                                                     self.policy.current_policy_hash(),
+                                                    &self.audit_retention,
                                                 );
                                                 err
                                             }
@@ -1275,6 +1297,45 @@ impl SentinelDashboard {
             self.self_last_error_ts
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".to_string())
+        ));
+
+        ui.separator();
+        ui.label(RichText::new("Storage health").strong());
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let audit_path = default_audit_path(&cwd);
+        let snapshot_path = &self.snapshot_history_path;
+
+        let audit_size = std::fs::metadata(&audit_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let audit_entries = audit_entry_count(&audit_path);
+        let snapshot_size = std::fs::metadata(snapshot_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let (archive_count, archive_bytes) = audit_archive_stats(&audit_path);
+
+        ui.monospace(format!(
+            "audit: {} entries, {} (max: {}, archive: {})",
+            audit_entries,
+            format_bytes(audit_size),
+            self.audit_retention.max_entries,
+            if self.audit_retention.archive_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+        if archive_count > 0 {
+            ui.monospace(format!(
+                "audit archives: {} files, {}",
+                archive_count,
+                format_bytes(archive_bytes)
+            ));
+        }
+        ui.monospace(format!(
+            "snapshots: {} (max: {})",
+            format_bytes(snapshot_size),
+            self.snapshot_history_max_entries
         ));
     }
 
@@ -1847,6 +1908,27 @@ impl eframe::App for SentinelDashboard {
                 });
             ui.add_space(4.0);
         });
+
+        if !self.config_warnings.is_empty() && !self.config_warnings_dismissed {
+            egui::TopBottomPanel::top("config_warnings_banner").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("⚠ Configuration warnings:")
+                            .strong()
+                            .color(egui::Color32::from_rgb(255, 180, 50)),
+                    );
+                    for w in &self.config_warnings {
+                        ui.label(
+                            RichText::new(format!("[{}] {}", w.area, w.message))
+                                .color(egui::Color32::from_rgb(255, 200, 100)),
+                        );
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        self.config_warnings_dismissed = true;
+                    }
+                });
+            });
+        }
 
         if self.show_onboarding {
             egui::Window::new("Operator Security Guide")
@@ -2505,26 +2587,30 @@ fn audit_auth_failure(
     reason: &str,
     actor: &str,
     policy_hash: Option<String>,
+    retention: &AuditRetentionConfig,
 ) {
     let (action_name, target) = match action {
         CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
         CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
         CommandAction::ReniceProcess { pid, .. } => ("renice_process", format!("pid:{pid}")),
     };
-    let _ = append_event(
+    let event = AuditEvent {
+        ts: now_ts(),
+        action: action_name.to_string(),
+        target,
+        result: format!("denied: auth_gate: {reason}"),
+        actor: actor.to_string(),
+        sig: None,
+        policy_hash,
+        anchor_txid: None,
+        anchor_blockheight: None,
+        anchor_merkle_root: None,
+    };
+    let _ = append_event_with_retention(
         &helper.audit_path,
-        &AuditEvent {
-            ts: now_ts(),
-            action: action_name.to_string(),
-            target,
-            result: format!("denied: auth_gate: {reason}"),
-            actor: actor.to_string(),
-            sig: None,
-            policy_hash,
-            anchor_txid: None,
-            anchor_blockheight: None,
-            anchor_merkle_root: None,
-        },
+        &event,
+        retention.max_entries,
+        retention.archive_enabled,
     );
 }
 
@@ -2534,26 +2620,30 @@ fn audit_policy_denial(
     reason: &str,
     actor: &str,
     policy_hash: Option<String>,
+    retention: &AuditRetentionConfig,
 ) {
     let (action_name, target) = match action {
         CommandAction::ShowCpu => ("show_cpu", "system".to_string()),
         CommandAction::KillProcess { pid } => ("kill_process", format!("pid:{pid}")),
         CommandAction::ReniceProcess { pid, .. } => ("renice_process", format!("pid:{pid}")),
     };
-    let _ = append_event(
+    let event = AuditEvent {
+        ts: now_ts(),
+        action: action_name.to_string(),
+        target,
+        result: format!("denied: policy_gate: {reason}"),
+        actor: actor.to_string(),
+        sig: None,
+        policy_hash,
+        anchor_txid: None,
+        anchor_blockheight: None,
+        anchor_merkle_root: None,
+    };
+    let _ = append_event_with_retention(
         &helper.audit_path,
-        &AuditEvent {
-            ts: now_ts(),
-            action: action_name.to_string(),
-            target,
-            result: format!("denied: policy_gate: {reason}"),
-            actor: actor.to_string(),
-            sig: None,
-            policy_hash,
-            anchor_txid: None,
-            anchor_blockheight: None,
-            anchor_merkle_root: None,
-        },
+        &event,
+        retention.max_entries,
+        retention.archive_enabled,
     );
 }
 
@@ -2562,23 +2652,27 @@ fn execute_action(
     action: CommandAction,
     actor: &str,
     policy_hash: Option<String>,
+    retention: &AuditRetentionConfig,
 ) -> String {
     match action {
         CommandAction::ShowCpu => {
-            let _ = append_event(
+            let event = AuditEvent {
+                ts: now_ts(),
+                action: "show_cpu".to_string(),
+                target: "system".to_string(),
+                result: "ok: local read action".to_string(),
+                actor: actor.to_string(),
+                sig: None,
+                policy_hash,
+                anchor_txid: None,
+                anchor_blockheight: None,
+                anchor_merkle_root: None,
+            };
+            let _ = append_event_with_retention(
                 &helper.audit_path,
-                &AuditEvent {
-                    ts: now_ts(),
-                    action: "show_cpu".to_string(),
-                    target: "system".to_string(),
-                    result: "ok: local read action".to_string(),
-                    actor: actor.to_string(),
-                    sig: None,
-                    policy_hash,
-                    anchor_txid: None,
-                    anchor_blockheight: None,
-                    anchor_merkle_root: None,
-                },
+                &event,
+                retention.max_entries,
+                retention.archive_enabled,
             );
             "Accepted: ShowCpu (local read-only action)".to_string()
         }
@@ -2794,4 +2888,19 @@ fn render_quick_tile(ui: &mut egui::Ui, label: &str, value: String) {
                 );
             });
         });
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }

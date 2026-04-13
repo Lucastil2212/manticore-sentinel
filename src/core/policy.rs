@@ -102,7 +102,13 @@ impl ExecutionPolicy {
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok());
         let raw = inline.or(file)?;
-        serde_json::from_str::<SystemActionPolicy>(&raw).ok()
+        match serde_json::from_str::<SystemActionPolicy>(&raw) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("failed to parse EVRUS policy JSON: {e}");
+                None
+            }
+        }
     }
 
     pub fn load_alert_policy() -> Option<AlertPolicy> {
@@ -111,7 +117,48 @@ impl ExecutionPolicy {
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok());
         let raw = inline.or(file)?;
-        serde_json::from_str::<AlertPolicy>(&raw).ok()
+        match serde_json::from_str::<AlertPolicy>(&raw) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("failed to parse alert policy JSON: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn policy_load_warnings() -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Ok(raw) = std::env::var("MANTICORE_EVRUS_POLICY_JSON") {
+            if serde_json::from_str::<SystemActionPolicy>(&raw).is_err() {
+                warnings.push("MANTICORE_EVRUS_POLICY_JSON contains invalid JSON".to_string());
+            }
+        }
+        if let Ok(path) = std::env::var("MANTICORE_EVRUS_POLICY_PATH") {
+            match std::fs::read_to_string(&path) {
+                Err(_) => warnings.push(format!("MANTICORE_EVRUS_POLICY_PATH '{}' not readable", path)),
+                Ok(raw) => {
+                    if serde_json::from_str::<SystemActionPolicy>(&raw).is_err() {
+                        warnings.push(format!("MANTICORE_EVRUS_POLICY_PATH '{}' contains invalid JSON", path));
+                    }
+                }
+            }
+        }
+        if let Ok(raw) = std::env::var("MANTICORE_ALERT_POLICY_JSON") {
+            if serde_json::from_str::<AlertPolicy>(&raw).is_err() {
+                warnings.push("MANTICORE_ALERT_POLICY_JSON contains invalid JSON".to_string());
+            }
+        }
+        if let Ok(path) = std::env::var("MANTICORE_ALERT_POLICY_PATH") {
+            match std::fs::read_to_string(&path) {
+                Err(_) => warnings.push(format!("MANTICORE_ALERT_POLICY_PATH '{}' not readable", path)),
+                Ok(raw) => {
+                    if serde_json::from_str::<AlertPolicy>(&raw).is_err() {
+                        warnings.push(format!("MANTICORE_ALERT_POLICY_PATH '{}' contains invalid JSON", path));
+                    }
+                }
+            }
+        }
+        warnings
     }
 
     pub fn evaluate(&self, action: &CommandAction) -> Result<PolicyDecision, String> {
