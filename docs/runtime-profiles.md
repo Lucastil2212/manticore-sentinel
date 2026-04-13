@@ -20,6 +20,7 @@ Profiles are loaded from `config/profiles/<name>.env`.
   - Optional PeerWeave graph publish path is scaffolded (disabled by default)
   - Evrmore audit anchoring enabled (RPC credentials required)
   - Local snapshot history persistence enabled (`.beads/state/snapshots.jsonl`)
+  - Optional alert policy scaffold via `MANTICORE_ALERT_POLICY_JSON` or `MANTICORE_ALERT_POLICY_PATH`
 
 ## Examples
 

@@ -13,7 +13,7 @@ use crate::core::{
     config::load_runtime_config,
     engine::SentinelEngine,
     history::{append_snapshot, default_snapshot_history_path, read_since},
-    policy::ExecutionPolicy,
+    policy::{AlertMatch, AlertSeverity, ExecutionPolicy},
     snapshot::SystemSnapshot,
 };
 use crate::models::process::ProcessMetrics;
@@ -146,6 +146,7 @@ pub struct SentinelDashboard {
     snapshot_history_path: std::path::PathBuf,
     snapshot_history_recent_hour: usize,
     last_snapshot_history_probe: Instant,
+    latest_alerts: Vec<AlertMatch>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -320,6 +321,7 @@ impl SentinelDashboard {
             snapshot_history_path,
             snapshot_history_recent_hour: 0,
             last_snapshot_history_probe: Instant::now() - Duration::from_secs(10),
+            latest_alerts: Vec::new(),
         })
     }
 
@@ -341,6 +343,7 @@ impl SentinelDashboard {
                         self.last_error = Some(format!("snapshot persistence failed: {err}"));
                     }
                 }
+                self.latest_alerts = self.policy.evaluate_snapshot_alerts(&snapshot);
                 if let Some(stream) = &self.event_stream {
                     let payload = serde_json::json!({
                         "timestamp": snapshot.timestamp,
@@ -1686,6 +1689,7 @@ impl SentinelDashboard {
                     format!("{}", self.snapshot_history_recent_hour),
                 );
             }
+            render_quick_tile(ui, "ALERTS", format!("{}", self.latest_alerts.len()));
             ui.label(
                 RichText::new(format!(" {} ", highest.label()))
                     .color(sev_fg)
@@ -1694,6 +1698,25 @@ impl SentinelDashboard {
                     .strong(),
             )
             .on_hover_text("Highest throughput severity across disk/network.");
+            if let Some(alert) = self.latest_alerts.first() {
+                let tag = match alert.severity {
+                    AlertSeverity::Info => "INFO",
+                    AlertSeverity::Warning => "WARN",
+                    AlertSeverity::Critical => "CRIT",
+                };
+                let color = match alert.severity {
+                    AlertSeverity::Info => egui::Color32::from_rgb(86, 145, 181),
+                    AlertSeverity::Warning => egui::Color32::from_rgb(196, 158, 66),
+                    AlertSeverity::Critical => egui::Color32::from_rgb(180, 66, 66),
+                };
+                ui.colored_label(
+                    color,
+                    format!(
+                        "{}: {} ({} {:.2} / {:.2})",
+                        tag, alert.rule_id, alert.message, alert.value, alert.threshold
+                    ),
+                );
+            }
         });
     }
 
