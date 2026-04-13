@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
+
 use crate::models::{
     cpu::CpuMetrics, disk::DiskMetrics, memory::MemoryMetrics, network::NetworkMetrics,
     process::ProcessMetrics,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemSnapshot {
     pub timestamp: u64,
     pub cpu: CpuMetrics,

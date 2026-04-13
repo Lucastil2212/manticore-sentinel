@@ -39,11 +39,18 @@ pub struct RuntimeConfig {
     pub token_lifecycle: Option<TokenLifecycle>,
     pub connectors: ConnectorConfig,
     pub event_stream: Option<EventStreamConfig>,
+    pub snapshot_history: SnapshotHistoryConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct EventStreamConfig {
     pub port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotHistoryConfig {
+    pub enabled: bool,
+    pub max_entries: usize,
 }
 
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
@@ -157,6 +164,14 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     } else {
         None
     };
+    let snapshot_history = SnapshotHistoryConfig {
+        enabled: parse_bool_env("MANTICORE_SNAPSHOT_HISTORY_ENABLED", true).unwrap_or(true),
+        max_entries: std::env::var("MANTICORE_SNAPSHOT_HISTORY_MAX_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5000)
+            .clamp(100, 200_000),
+    };
 
     Ok(RuntimeConfig {
         profile,
@@ -169,6 +184,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         token_lifecycle,
         connectors,
         event_stream,
+        snapshot_history,
     })
 }
 

@@ -1,4 +1,6 @@
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuMetrics {
     pub usage_percent: f32,
     pub per_core: Vec<f32>,

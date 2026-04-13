@@ -19,6 +19,7 @@ Profiles are loaded from `config/profiles/<name>.env`.
   - PeerWeave + EVRUS connectors enabled
   - Optional PeerWeave graph publish path is scaffolded (disabled by default)
   - Evrmore audit anchoring enabled (RPC credentials required)
+  - Local snapshot history persistence enabled (`.beads/state/snapshots.jsonl`)
 
 ## Examples
 

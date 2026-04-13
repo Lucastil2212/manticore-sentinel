@@ -12,6 +12,7 @@ use crate::core::{
     command::{parse_command, CommandAction},
     config::load_runtime_config,
     engine::SentinelEngine,
+    history::{append_snapshot, default_snapshot_history_path, read_since},
     policy::ExecutionPolicy,
     snapshot::SystemSnapshot,
 };
@@ -140,6 +141,11 @@ pub struct SentinelDashboard {
     event_stream: Option<EventStreamOutput>,
     event_stream_audit_offset: usize,
     last_event_stream_audit_poll: Instant,
+    snapshot_history_enabled: bool,
+    snapshot_history_max_entries: usize,
+    snapshot_history_path: std::path::PathBuf,
+    snapshot_history_recent_hour: usize,
+    last_snapshot_history_probe: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -240,6 +246,7 @@ impl SentinelDashboard {
             .map(|ev| Duration::from_secs(ev.anchor_interval_secs))
             .unwrap_or(Duration::from_secs(300));
         let anchor_state = load_anchor_state(&audit_path).unwrap_or_default();
+        let snapshot_history_path = default_snapshot_history_path(&cwd);
 
         let mut engine = SentinelEngine::new();
         engine.init_connectors(&cfg.connectors);
@@ -307,6 +314,11 @@ impl SentinelDashboard {
             event_stream,
             event_stream_audit_offset: 0,
             last_event_stream_audit_poll: Instant::now() - Duration::from_secs(5),
+            snapshot_history_enabled: cfg.snapshot_history.enabled,
+            snapshot_history_max_entries: cfg.snapshot_history.max_entries,
+            snapshot_history_path,
+            snapshot_history_recent_hour: 0,
+            last_snapshot_history_probe: Instant::now() - Duration::from_secs(10),
         })
     }
 
@@ -319,6 +331,15 @@ impl SentinelDashboard {
         match self.runtime.block_on(self.engine.collect()) {
             Ok(snapshot) => {
                 self.engine.ingest_system_snapshot(&snapshot);
+                if self.snapshot_history_enabled {
+                    if let Err(err) = append_snapshot(
+                        &self.snapshot_history_path,
+                        &snapshot,
+                        self.snapshot_history_max_entries,
+                    ) {
+                        self.last_error = Some(format!("snapshot persistence failed: {err}"));
+                    }
+                }
                 if let Some(stream) = &self.event_stream {
                     let payload = serde_json::json!({
                         "timestamp": snapshot.timestamp,
@@ -387,6 +408,20 @@ impl SentinelDashboard {
                 self.event_stream_audit_offset = next_offset;
             }
             self.last_event_stream_audit_poll = Instant::now();
+        }
+
+        if self.snapshot_history_enabled
+            && self.last_snapshot_history_probe.elapsed() >= Duration::from_secs(10)
+        {
+            let now = now_unix_secs();
+            let min_ts = now.saturating_sub(3600);
+            match read_since(&self.snapshot_history_path, min_ts) {
+                Ok(rows) => self.snapshot_history_recent_hour = rows.len(),
+                Err(err) => {
+                    self.last_error = Some(format!("snapshot history query failed: {err}"));
+                }
+            }
+            self.last_snapshot_history_probe = Instant::now();
         }
     }
 
@@ -1642,6 +1677,13 @@ impl SentinelDashboard {
             render_quick_tile(ui, "MEM", format!("{:.0}%", mem_pct));
             render_quick_tile(ui, "DISK BW", human_bytes(total_disk_bw));
             render_quick_tile(ui, "NET BW", human_bytes(total_net_bw));
+            if self.snapshot_history_enabled {
+                render_quick_tile(
+                    ui,
+                    "HIST 1H",
+                    format!("{}", self.snapshot_history_recent_hour),
+                );
+            }
             ui.label(
                 RichText::new(format!(" {} ", highest.label()))
                     .color(sev_fg)
