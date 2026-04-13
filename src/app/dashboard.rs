@@ -32,6 +32,8 @@ const ID_COMMAND_INPUT: &str = "command_palette_input";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DashboardView {
     System,
+    Processes,
+    Network,
     PeerWeave,
     Evrus,
     Audit,
@@ -39,9 +41,11 @@ enum DashboardView {
 }
 
 impl DashboardView {
-    fn all() -> [DashboardView; 5] {
+    fn all() -> [DashboardView; 7] {
         [
             DashboardView::System,
+            DashboardView::Processes,
+            DashboardView::Network,
             DashboardView::PeerWeave,
             DashboardView::Evrus,
             DashboardView::Audit,
@@ -52,6 +56,8 @@ impl DashboardView {
     fn label(self) -> &'static str {
         match self {
             DashboardView::System => "System",
+            DashboardView::Processes => "Processes",
+            DashboardView::Network => "Network",
             DashboardView::PeerWeave => "PeerWeave",
             DashboardView::Evrus => "EVRUS",
             DashboardView::Audit => "Audit",
@@ -116,6 +122,16 @@ pub struct SentinelDashboard {
     anchor_interval: Duration,
     last_anchor_poll: Instant,
     last_policy_hash: Option<String>,
+    process_sort: ProcessSort,
+    audit_filter: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessSort {
+    CpuDesc,
+    RssDesc,
+    PidAsc,
+    ThreadsDesc,
 }
 
 impl SentinelDashboard {
@@ -260,6 +276,8 @@ impl SentinelDashboard {
             anchor_interval,
             last_anchor_poll: Instant::now() - anchor_interval,
             last_policy_hash,
+            process_sort: ProcessSort::CpuDesc,
+            audit_filter: String::new(),
         })
     }
 
@@ -1303,6 +1321,10 @@ impl SentinelDashboard {
 
     fn render_audit_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("Audit");
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.text_edit_singleline(&mut self.audit_filter);
+        });
         let current_merkle = current_merkle_root(&self.helper.audit_path)
             .ok()
             .flatten();
@@ -1350,7 +1372,18 @@ impl SentinelDashboard {
             ui.label("No audit events yet.");
             return;
         }
+        let filter = self.audit_filter.trim().to_ascii_lowercase();
         for event in &self.audit_feed {
+            if !filter.is_empty() {
+                let haystack = format!(
+                    "{} {} {} {} {}",
+                    event.action, event.target, event.result, event.actor, event.ts
+                )
+                .to_ascii_lowercase();
+                if !haystack.contains(&filter) {
+                    continue;
+                }
+            }
             ui.monospace(format!(
                 "[{}] action={} target={} result={} actor={} policy={} txid={} bh={}",
                 event.ts,
@@ -1365,6 +1398,49 @@ impl SentinelDashboard {
                     .unwrap_or_else(|| "-".to_string())
             ));
         }
+    }
+
+    fn render_processes_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Processes");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Sort");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::CpuDesc, "CPU");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::RssDesc, "RSS");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::PidAsc, "PID");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::ThreadsDesc, "Threads");
+        });
+        ui.separator();
+        let Some(snapshot) = &self.latest else {
+            ui.spinner();
+            ui.label("Collecting first snapshot...");
+            return;
+        };
+        let mut rows: Vec<ProcessMetrics> = snapshot.processes.clone();
+        match self.process_sort {
+            ProcessSort::CpuDesc => rows.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
+            ProcessSort::RssDesc => rows.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
+            ProcessSort::PidAsc => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
+            ProcessSort::ThreadsDesc => rows.sort_by(|a, b| b.threads.cmp(&a.threads)),
+        }
+        process_metrics_table(ui, &rows);
+    }
+
+    fn render_network_view(&self, ui: &mut egui::Ui) {
+        ui.heading("Network & Throughput");
+        let Some(snapshot) = &self.latest else {
+            ui.spinner();
+            ui.label("Collecting first snapshot...");
+            return;
+        };
+        ui.group(|ui| {
+            ui.label(RichText::new("Interfaces").strong());
+            network_throughput_rows(ui, snapshot);
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Disk throughput").strong());
+            disk_throughput_rows(ui, snapshot);
+        });
     }
 
     fn render_system_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, central_fill_w: f32) {
@@ -1638,6 +1714,8 @@ impl eframe::App for SentinelDashboard {
                     ui.add_space(8.0);
                     match self.active_view {
                         DashboardView::System => self.render_system_view(ui, ctx, central_fill_w),
+                        DashboardView::Processes => self.render_processes_view(ui),
+                        DashboardView::Network => self.render_network_view(ui),
                         DashboardView::PeerWeave => self.render_peerweave_view(ui),
                         DashboardView::Evrus => self.render_evrus_view(ui),
                         DashboardView::Audit => self.render_audit_view(ui),
