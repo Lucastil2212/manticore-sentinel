@@ -35,6 +35,12 @@ pub struct RuntimeConfig {
     pub auth_token: Option<String>,
     pub token_lifecycle: Option<TokenLifecycle>,
     pub connectors: ConnectorConfig,
+    pub event_stream: Option<EventStreamConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventStreamConfig {
+    pub port: u16,
 }
 
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
@@ -136,6 +142,16 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         }
     }
 
+    let event_stream = if parse_bool_env("MANTICORE_EVENT_STREAM_ENABLED", false).unwrap_or(false) {
+        let port = std::env::var("MANTICORE_EVENT_STREAM_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(9462);
+        Some(EventStreamConfig { port })
+    } else {
+        None
+    };
+
     Ok(RuntimeConfig {
         profile,
         privileged,
@@ -146,6 +162,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         auth_token,
         token_lifecycle,
         connectors,
+        event_stream,
     })
 }
 

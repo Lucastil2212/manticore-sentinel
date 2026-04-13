@@ -18,7 +18,7 @@ use crate::core::{
 use crate::models::process::ProcessMetrics;
 use crate::security::audit::{
     anchor_audit_if_due, append_event, current_merkle_root, default_audit_path, load_anchor_state,
-    now_ts, read_recent, AnchorConfig, AnchorState, AuditEvent,
+    now_ts, read_from_offset, read_recent, AnchorConfig, AnchorState, AuditEvent,
 };
 use crate::security::auth::{AuthContext, AuthGate, AuthMode, TokenLifecycle};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
@@ -26,6 +26,7 @@ use crate::utils::time::now_unix_secs;
 use tracing::error;
 
 use super::icons;
+use super::event_stream::EventStreamOutput;
 
 const ID_COMMAND_INPUT: &str = "command_palette_input";
 
@@ -136,6 +137,9 @@ pub struct SentinelDashboard {
     last_policy_hash: Option<String>,
     process_sort: ProcessSort,
     audit_filter: String,
+    event_stream: Option<EventStreamOutput>,
+    event_stream_audit_offset: usize,
+    last_event_stream_audit_poll: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,6 +251,18 @@ impl SentinelDashboard {
 
         let policy = ExecutionPolicy::new(auth, ExecutionPolicy::load_evrus_policy());
         let last_policy_hash = policy.current_policy_hash();
+        let event_stream = cfg
+            .event_stream
+            .as_ref()
+            .and_then(|es| {
+                EventStreamOutput::start(
+                    es.port,
+                    cfg.auth_mode,
+                    cfg.auth_token.clone(),
+                    evrus_jwt.clone(),
+                )
+                .ok()
+            });
 
         Ok(Self {
             engine,
@@ -290,6 +306,9 @@ impl SentinelDashboard {
             last_policy_hash,
             process_sort: ProcessSort::CpuDesc,
             audit_filter: String::new(),
+            event_stream,
+            event_stream_audit_offset: 0,
+            last_event_stream_audit_poll: Instant::now() - Duration::from_secs(5),
         })
     }
 
@@ -301,6 +320,19 @@ impl SentinelDashboard {
 
         match self.runtime.block_on(self.engine.collect()) {
             Ok(snapshot) => {
+                if let Some(stream) = &self.event_stream {
+                    let payload = serde_json::json!({
+                        "timestamp": snapshot.timestamp,
+                        "cpu_usage_percent": snapshot.cpu.usage_percent,
+                        "load_avg": [snapshot.cpu.load_avg.0, snapshot.cpu.load_avg.1, snapshot.cpu.load_avg.2],
+                        "memory_used": snapshot.memory.used,
+                        "memory_total": snapshot.memory.total,
+                        "disk_count": snapshot.disks.len(),
+                        "network_count": snapshot.network.len(),
+                        "process_count": snapshot.processes.len(),
+                    });
+                    stream.emit_json("system_snapshot", &payload);
+                }
                 self.latest = Some(snapshot);
                 self.last_error = None;
             }
@@ -334,6 +366,24 @@ impl SentinelDashboard {
                 }
                 self.last_anchor_poll = Instant::now();
             }
+        }
+
+        if self.event_stream.is_some()
+            && self.last_event_stream_audit_poll.elapsed() >= Duration::from_secs(1)
+        {
+            if let Ok((events, next_offset)) =
+                read_from_offset(&self.helper.audit_path, self.event_stream_audit_offset)
+            {
+                if let Some(stream) = &self.event_stream {
+                    for event in events {
+                        if let Ok(payload) = serde_json::to_value(&event) {
+                            stream.emit_json("audit_event", &payload);
+                        }
+                    }
+                }
+                self.event_stream_audit_offset = next_offset;
+            }
+            self.last_event_stream_audit_poll = Instant::now();
         }
     }
 

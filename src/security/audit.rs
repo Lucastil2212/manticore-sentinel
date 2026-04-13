@@ -146,6 +146,18 @@ pub fn read_recent(path: &Path, limit: usize) -> anyhow::Result<Vec<AuditEvent>>
     Ok(events)
 }
 
+pub fn read_from_offset(path: &Path, offset: usize) -> anyhow::Result<(Vec<AuditEvent>, usize)> {
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut events = Vec::new();
+    for line in lines.iter().skip(offset) {
+        if let Ok(ev) = serde_json::from_str::<AuditEvent>(line) {
+            events.push(ev);
+        }
+    }
+    Ok((events, lines.len()))
+}
+
 pub fn current_merkle_root(path: &Path) -> anyhow::Result<Option<String>> {
     let raw = fs::read_to_string(path).unwrap_or_default();
     let mut leaves: Vec<[u8; 32]> = Vec::new();
