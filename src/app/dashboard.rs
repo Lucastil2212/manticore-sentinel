@@ -147,6 +147,12 @@ pub struct SentinelDashboard {
     snapshot_history_recent_hour: usize,
     last_snapshot_history_probe: Instant,
     latest_alerts: Vec<AlertMatch>,
+    self_collect_last_ms: f64,
+    self_collect_avg_ms: f64,
+    self_collect_cycles: u64,
+    self_connector_polls: u64,
+    self_errors_total: u64,
+    self_last_error_ts: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -322,6 +328,12 @@ impl SentinelDashboard {
             snapshot_history_recent_hour: 0,
             last_snapshot_history_probe: Instant::now() - Duration::from_secs(10),
             latest_alerts: Vec::new(),
+            self_collect_last_ms: 0.0,
+            self_collect_avg_ms: 0.0,
+            self_collect_cycles: 0,
+            self_connector_polls: 0,
+            self_errors_total: 0,
+            self_last_error_ts: None,
         })
     }
 
@@ -331,8 +343,17 @@ impl SentinelDashboard {
         }
         self.last_poll = Instant::now();
 
+        let collect_started = Instant::now();
         match self.runtime.block_on(self.engine.collect()) {
             Ok(snapshot) => {
+                self.self_collect_last_ms = collect_started.elapsed().as_secs_f64() * 1000.0;
+                self.self_collect_cycles = self.self_collect_cycles.saturating_add(1);
+                if self.self_collect_cycles == 1 {
+                    self.self_collect_avg_ms = self.self_collect_last_ms;
+                } else {
+                    self.self_collect_avg_ms =
+                        (self.self_collect_avg_ms * 0.9) + (self.self_collect_last_ms * 0.1);
+                }
                 self.engine.ingest_system_snapshot(&snapshot);
                 if self.snapshot_history_enabled {
                     if let Err(err) = append_snapshot(
@@ -341,6 +362,8 @@ impl SentinelDashboard {
                         self.snapshot_history_max_entries,
                     ) {
                         self.last_error = Some(format!("snapshot persistence failed: {err}"));
+                        self.self_errors_total = self.self_errors_total.saturating_add(1);
+                        self.self_last_error_ts = Some(now_unix_secs());
                     }
                 }
                 self.latest_alerts = self.policy.evaluate_snapshot_alerts(&snapshot);
@@ -364,6 +387,8 @@ impl SentinelDashboard {
             Err(err) => {
                 self.last_error = Some(err.to_string());
                 error!(category = "collector", message = %err, "snapshot collection failed");
+                self.self_errors_total = self.self_errors_total.saturating_add(1);
+                self.self_last_error_ts = Some(now_unix_secs());
             }
         }
 
@@ -371,6 +396,7 @@ impl SentinelDashboard {
             && self.last_connector_poll.elapsed() >= self.connector_poll_interval
         {
             self.connector_summary = self.engine.poll_connectors();
+            self.self_connector_polls = self.self_connector_polls.saturating_add(1);
             self.last_connector_poll = Instant::now();
         }
 
@@ -391,6 +417,8 @@ impl SentinelDashboard {
                     }
                     Err(err) => {
                         self.last_error = Some(format!("audit anchor failed: {err}"));
+                        self.self_errors_total = self.self_errors_total.saturating_add(1);
+                        self.self_last_error_ts = Some(now_unix_secs());
                     }
                 }
                 self.last_anchor_poll = Instant::now();
@@ -424,6 +452,8 @@ impl SentinelDashboard {
                 Ok(rows) => self.snapshot_history_recent_hour = rows.len(),
                 Err(err) => {
                     self.last_error = Some(format!("snapshot history query failed: {err}"));
+                    self.self_errors_total = self.self_errors_total.saturating_add(1);
+                    self.self_last_error_ts = Some(now_unix_secs());
                 }
             }
             self.last_snapshot_history_probe = Instant::now();
@@ -1229,6 +1259,23 @@ impl SentinelDashboard {
                 self.render_connector_row(ui, entry);
             }
         }
+        ui.separator();
+        ui.label(RichText::new("Self-health telemetry").strong());
+        ui.monospace(format!(
+            "collect_last_ms={:.3} collect_avg_ms={:.3} cycles={} connector_polls={}",
+            self.self_collect_last_ms,
+            self.self_collect_avg_ms,
+            self.self_collect_cycles,
+            self.self_connector_polls
+        ));
+        ui.monospace(format!(
+            "alerts_active={} errors_total={} last_error_ts={}",
+            self.latest_alerts.len(),
+            self.self_errors_total,
+            self.self_last_error_ts
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
     }
 
     fn render_connector_row(&self, ui: &mut egui::Ui, health: &crate::connectors::ConnectorHealth) {
