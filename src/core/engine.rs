@@ -64,6 +64,12 @@ impl SentinelEngine {
         })
     }
 
+    pub fn ingest_system_snapshot(&mut self, snapshot: &SystemSnapshot) {
+        for conn in &mut self.ecosystem_connectors {
+            conn.ingest_system_snapshot(snapshot);
+        }
+    }
+
     /// Poll all ecosystem connectors and return a health summary.
     /// Called on a slower cadence than system collection (every ~10 core
     /// cycles by default) so connector HTTP calls don't block the UI loop.

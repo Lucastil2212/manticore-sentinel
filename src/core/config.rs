@@ -5,6 +5,9 @@ pub struct PeerWeaveConfig {
     pub graphql_url: String,
     pub cap_token: Option<String>,
     pub poll_ms: u64,
+    pub publish_enabled: bool,
+    pub publish_space_id: Option<String>,
+    pub publish_interval_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,14 +49,16 @@ pub struct EventStreamConfig {
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     let profile = std::env::var("MANTICORE_PROFILE").unwrap_or_else(|_| "default".to_string());
     let privileged = parse_bool_env("MANTICORE_PRIVILEGED", false)?;
-    let helper_mode = std::env::var("MANTICORE_HELPER_MODE").unwrap_or_else(|_| "embedded".to_string());
+    let helper_mode =
+        std::env::var("MANTICORE_HELPER_MODE").unwrap_or_else(|_| "embedded".to_string());
     if helper_mode != "embedded" && helper_mode != "subprocess" {
         return Err(anyhow::anyhow!(
             "invalid MANTICORE_HELPER_MODE '{}', expected embedded|subprocess",
             helper_mode
         ));
     }
-    let auth_mode_raw = std::env::var("MANTICORE_AUTH_MODE").unwrap_or_else(|_| "local".to_string());
+    let auth_mode_raw =
+        std::env::var("MANTICORE_AUTH_MODE").unwrap_or_else(|_| "local".to_string());
     let auth_mode = AuthMode::from_env(&auth_mode_raw).ok_or_else(|| {
         anyhow::anyhow!(
             "invalid MANTICORE_AUTH_MODE '{}', expected local|token|evrus",
@@ -73,7 +78,9 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
             role_raw
         )
     })?;
-    let auth_token = std::env::var("MANTICORE_AUTH_TOKEN").ok().map(|v| v.trim().to_string());
+    let auth_token = std::env::var("MANTICORE_AUTH_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string());
     if auth_mode == AuthMode::Token {
         let Some(token) = auth_token.as_ref() else {
             return Err(anyhow::anyhow!(
@@ -129,12 +136,11 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         ));
     }
 
-    let connectors = load_connector_config();
+    let connectors = load_connector_config(&auth_mode);
     if auth_mode == AuthMode::Evrus {
-        let evrus = connectors
-            .evrus
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MANTICORE_AUTH_MODE=evrus requires EVRUS connector enabled"))?;
+        let evrus = connectors.evrus.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("MANTICORE_AUTH_MODE=evrus requires EVRUS connector enabled")
+        })?;
         if evrus.jwt.as_deref().unwrap_or("").trim().is_empty() {
             return Err(anyhow::anyhow!(
                 "MANTICORE_AUTH_MODE=evrus requires MANTICORE_EVRUS_JWT"
@@ -166,7 +172,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     })
 }
 
-fn load_connector_config() -> ConnectorConfig {
+fn load_connector_config(auth_mode: &AuthMode) -> ConnectorConfig {
     let peerweave = if parse_bool_env("MANTICORE_PEERWEAVE_ENABLED", false).unwrap_or(false) {
         let graphql_url = std::env::var("MANTICORE_PEERWEAVE_GRAPHQL_URL")
             .unwrap_or_else(|_| "http://localhost:3200/graphql".to_string());
@@ -176,15 +182,34 @@ fn load_connector_config() -> ConnectorConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000)
             .clamp(1000, 30000);
+        let publish_enabled =
+            parse_bool_env("MANTICORE_PEERWEAVE_PUBLISH_ENABLED", false).unwrap_or(false);
+        let publish_space_id = std::env::var("MANTICORE_PEERWEAVE_PUBLISH_SPACE_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let publish_interval_ms = std::env::var("MANTICORE_PEERWEAVE_PUBLISH_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000)
+            .clamp(1000, 30000);
+        let trust_mode = auth_mode.as_str();
         tracing::info!(
             graphql_url = %graphql_url,
             poll_ms = poll_ms,
+            publish_enabled = publish_enabled,
+            publish_space_id = ?publish_space_id,
+            publish_interval_ms = publish_interval_ms,
+            trust_mode = trust_mode,
             "PeerWeave connector enabled"
         );
         Some(PeerWeaveConfig {
             graphql_url,
             cap_token,
             poll_ms,
+            publish_enabled,
+            publish_space_id,
+            publish_interval_ms,
         })
     } else {
         None

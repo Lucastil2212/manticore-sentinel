@@ -1,6 +1,7 @@
-pub mod peerweave;
 pub mod evrus;
+pub mod peerweave;
 
+use crate::core::snapshot::SystemSnapshot;
 use std::fmt;
 
 /// Runtime status of an ecosystem connector.
@@ -80,6 +81,7 @@ pub trait Connector: Send + Sync {
     fn status(&self) -> ConnectorStatus;
     fn health_check(&mut self) -> ConnectorHealth;
     fn collect(&mut self) -> Option<ConnectorSnapshot>;
+    fn ingest_system_snapshot(&mut self, _snapshot: &SystemSnapshot) {}
 }
 
 /// Aggregated view of all connector states for the dashboard.

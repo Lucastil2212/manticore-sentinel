@@ -318,6 +318,7 @@ impl SentinelDashboard {
 
         match self.runtime.block_on(self.engine.collect()) {
             Ok(snapshot) => {
+                self.engine.ingest_system_snapshot(&snapshot);
                 if let Some(stream) = &self.event_stream {
                     let payload = serde_json::json!({
                         "timestamp": snapshot.timestamp,
