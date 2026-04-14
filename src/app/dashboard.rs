@@ -42,6 +42,42 @@ const SECTION_CONTROL: &str = "control_activity";
 const SECTION_PROCESSES: &str = "processes";
 const SECTION_AUDIT: &str = "audit";
 const SECTION_CONNECTORS: &str = "connectors";
+const METRIC_HISTORY_CAP: usize = 360;
+
+#[derive(Clone)]
+struct MetricSample {
+    ts: u64,
+    cpu_pct: f32,
+    mem_pct: f32,
+    disk_bps: f64,
+    net_bps: f64,
+    process_count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimeWindow {
+    Last5m,
+    Last1h,
+    Last24h,
+}
+
+impl TimeWindow {
+    fn seconds(self) -> u64 {
+        match self {
+            Self::Last5m => 5 * 60,
+            Self::Last1h => 60 * 60,
+            Self::Last24h => 24 * 60 * 60,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Last5m => "5m",
+            Self::Last1h => "1h",
+            Self::Last24h => "24h",
+        }
+    }
+}
 
 fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
     let low = typed.trim_start().to_ascii_lowercase();
@@ -53,6 +89,15 @@ fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
         .copied()
         .filter(|c| c.to_ascii_lowercase().starts_with(&low))
         .collect()
+}
+
+fn run_scoped_snapshot_history_path(root: &std::path::Path) -> std::path::PathBuf {
+    let run_ts = now_unix_secs();
+    let base = default_snapshot_history_path(root);
+    let parent = base.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| {
+        root.join(".beads").join("state")
+    });
+    parent.join(format!("snapshots-{run_ts}.jsonl"))
 }
 
 pub struct SentinelDashboard {
@@ -139,6 +184,13 @@ pub struct SentinelDashboard {
     self_connector_polls: u64,
     self_errors_total: u64,
     self_last_error_ts: Option<u64>,
+    time_window: TimeWindow,
+    metric_history: VecDeque<MetricSample>,
+    process_count_history: VecDeque<(u64, usize)>,
+    process_churn_history: VecDeque<(u64, usize, usize)>,
+    audit_rate_history: VecDeque<(u64, usize, usize)>,
+    connector_latency_history: VecDeque<(u64, Option<f64>, Option<f64>)>,
+    previous_process_ids: HashSet<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,6 +202,129 @@ enum ProcessSort {
 }
 
 impl SentinelDashboard {
+    fn hydrate_metric_history_from_disk(&mut self) {
+        let raw = match std::fs::read_to_string(&self.snapshot_history_path) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let ts = row.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+            if ts == 0 {
+                continue;
+            }
+            let cpu_pct = row
+                .get("cpu")
+                .and_then(|v| v.get("usage_percent"))
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .or_else(|| {
+                    row.get("cpu_usage_percent")
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                })
+                .unwrap_or(0.0);
+            let memory_used = row
+                .get("memory")
+                .and_then(|v| v.get("used"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| row.get("memory_used").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            let memory_total = row
+                .get("memory")
+                .and_then(|v| v.get("total"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| row.get("memory_total").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            let mem_pct = if memory_total == 0 {
+                0.0
+            } else {
+                (memory_used as f32 / memory_total as f32) * 100.0
+            };
+            let disk_bps = row
+                .get("disks")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().fold(0.0, |acc, disk| {
+                        let r = disk
+                            .get("read_bytes_per_sec")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let w = disk
+                            .get("write_bytes_per_sec")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        acc + r.saturating_add(w) as f64
+                    })
+                })
+                .unwrap_or(0.0);
+            let net_bps = row
+                .get("network")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().fold(0.0, |acc, net| {
+                        let rx = net.get("rx_bytes_per_sec").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let tx = net.get("tx_bytes_per_sec").and_then(|v| v.as_u64()).unwrap_or(0);
+                        acc + rx.saturating_add(tx) as f64
+                    })
+                })
+                .unwrap_or(0.0);
+            let process_count = row
+                .get("processes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .or_else(|| {
+                    row.get("process_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                })
+                .unwrap_or(0);
+            push_history(
+                &mut self.metric_history,
+                MetricSample {
+                    ts,
+                    cpu_pct,
+                    mem_pct,
+                    disk_bps,
+                    net_bps,
+                    process_count,
+                },
+                METRIC_HISTORY_CAP,
+            );
+            push_history(
+                &mut self.process_count_history,
+                (ts, process_count),
+                METRIC_HISTORY_CAP,
+            );
+        }
+    }
+
+    fn render_time_window_selector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Trend window");
+            for window in [TimeWindow::Last5m, TimeWindow::Last1h, TimeWindow::Last24h] {
+                ui.selectable_value(&mut self.time_window, window, window.label());
+            }
+            ui.label(
+                RichText::new("Applies to overview, process, audit, and connector charts.").weak(),
+            );
+        });
+    }
+
+    fn metric_window_samples(&self) -> Vec<&MetricSample> {
+        let now = now_unix_secs();
+        let min_ts = now.saturating_sub(self.time_window.seconds());
+        self.metric_history
+            .iter()
+            .filter(|sample| sample.ts >= min_ts)
+            .collect()
+    }
+
     fn current_actor(&self) -> String {
         self.evrus_jwt
             .as_deref()
@@ -241,9 +416,17 @@ impl SentinelDashboard {
             .map(|ev| Duration::from_secs(ev.anchor_interval_secs))
             .unwrap_or(Duration::from_secs(300));
         let anchor_state = load_anchor_state(&audit_path).unwrap_or_default();
-        let snapshot_history_path = default_snapshot_history_path(&cwd);
+        let snapshot_history_path = run_scoped_snapshot_history_path(&cwd);
         if cfg.snapshot_history.enabled && cfg.snapshot_history.reset_on_start {
             reset_snapshot_history(&snapshot_history_path)?;
+        }
+        if cfg.snapshot_history.enabled {
+            if let Some(parent) = snapshot_history_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if !snapshot_history_path.exists() {
+                std::fs::write(&snapshot_history_path, "")?;
+            }
         }
 
         let mut engine = SentinelEngine::new(cfg.process_max_entries, cfg.process_cmdline_entries);
@@ -278,7 +461,7 @@ impl SentinelDashboard {
         let poll_interval = Duration::from_millis(cfg.refresh_ms);
         let ui_repaint_interval = Duration::from_millis(cfg.refresh_ms.clamp(250, 1500));
 
-        Ok(Self {
+        let mut dashboard = Self {
             engine,
             runtime: Runtime::new()?,
             latest: None,
@@ -364,7 +547,16 @@ impl SentinelDashboard {
             self_connector_polls: 0,
             self_errors_total: 0,
             self_last_error_ts: None,
-        })
+            time_window: TimeWindow::Last1h,
+            metric_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
+            process_count_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
+            process_churn_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
+            audit_rate_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
+            connector_latency_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
+            previous_process_ids: HashSet::new(),
+        };
+        dashboard.hydrate_metric_history_from_disk();
+        Ok(dashboard)
     }
 
     fn poll(&mut self) {
@@ -385,6 +577,54 @@ impl SentinelDashboard {
                         (self.self_collect_avg_ms * 0.9) + (self.self_collect_last_ms * 0.1);
                 }
                 self.engine.ingest_system_snapshot(&snapshot);
+                let mem_pct = if snapshot.memory.total == 0 {
+                    0.0
+                } else {
+                    (snapshot.memory.used as f32 / snapshot.memory.total as f32) * 100.0
+                };
+                let disk_bps: f64 = snapshot
+                    .disks
+                    .iter()
+                    .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec) as f64)
+                    .sum();
+                let net_bps: f64 = snapshot
+                    .network
+                    .iter()
+                    .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec) as f64)
+                    .sum();
+                push_history(
+                    &mut self.metric_history,
+                    MetricSample {
+                        ts: snapshot.timestamp,
+                        cpu_pct: snapshot.cpu.usage_percent,
+                        mem_pct,
+                        disk_bps,
+                        net_bps,
+                        process_count: snapshot.processes.len(),
+                    },
+                    METRIC_HISTORY_CAP,
+                );
+                push_history(
+                    &mut self.process_count_history,
+                    (snapshot.timestamp, snapshot.processes.len()),
+                    METRIC_HISTORY_CAP,
+                );
+                let current_ids: HashSet<u32> = snapshot.processes.iter().map(|p| p.pid).collect();
+                if !self.previous_process_ids.is_empty() {
+                    let started = current_ids
+                        .difference(&self.previous_process_ids)
+                        .count();
+                    let exited = self
+                        .previous_process_ids
+                        .difference(&current_ids)
+                        .count();
+                    push_history(
+                        &mut self.process_churn_history,
+                        (snapshot.timestamp, started, exited),
+                        METRIC_HISTORY_CAP,
+                    );
+                }
+                self.previous_process_ids = current_ids;
                 if self.snapshot_history_enabled {
                     if let Err(err) = append_snapshot(
                         &self.snapshot_history_path,
@@ -431,6 +671,20 @@ impl SentinelDashboard {
             && self.last_connector_poll.elapsed() >= self.connector_poll_interval
         {
             self.connector_summary = self.engine.poll_connectors();
+            let now = now_unix_secs();
+            let pw = self
+                .connector_summary
+                .health_for("PeerWeave")
+                .and_then(|h| h.latency_ms);
+            let evrus = self
+                .connector_summary
+                .health_for("EVRUS")
+                .and_then(|h| h.latency_ms);
+            push_history(
+                &mut self.connector_latency_history,
+                (now, pw, evrus),
+                METRIC_HISTORY_CAP,
+            );
             self.self_connector_polls = self.self_connector_polls.saturating_add(1);
             self.last_connector_poll = Instant::now();
         }
@@ -493,6 +747,18 @@ impl SentinelDashboard {
             }
             self.last_snapshot_history_probe = Instant::now();
         }
+        let (allow_count, deny_count) = self.audit_feed.iter().fold((0usize, 0usize), |acc, event| {
+            if event.result.to_ascii_lowercase().contains("denied") {
+                (acc.0, acc.1 + 1)
+            } else {
+                (acc.0 + 1, acc.1)
+            }
+        });
+        push_history(
+            &mut self.audit_rate_history,
+            (now_unix_secs(), allow_count, deny_count),
+            METRIC_HISTORY_CAP,
+        );
     }
 
     fn verify_auth_submission(&mut self, action: &CommandAction) -> Result<(), String> {
@@ -1615,6 +1881,7 @@ impl SentinelDashboard {
 
     fn render_unified_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.render_overview_quick_tiles(ui);
+        self.render_time_window_selector(ui);
         ui.add_space(8.0);
 
         // --- Overview section (CPU + Memory) ---
@@ -1635,7 +1902,8 @@ impl SentinelDashboard {
             );
             ui.add_space(4.0);
             if let Some(snapshot) = &self.latest {
-                render_overview_metrics(ui, snapshot, self.detailed_mode);
+                let samples = self.metric_window_samples();
+                render_overview_metrics(ui, snapshot, &samples, self.detailed_mode);
             } else {
                 ui.spinner();
                 ui.label("Collecting first snapshot...");
@@ -1665,7 +1933,7 @@ impl SentinelDashboard {
                             "Disk throughput",
                             "Per-device read/write rates.",
                         );
-                        disk_throughput_rows(ui, snapshot);
+                        disk_throughput_rows(ui, snapshot, &self.metric_window_samples());
                     });
                     ui.add_space(8.0);
                     ui.group(|ui| {
@@ -1677,7 +1945,7 @@ impl SentinelDashboard {
                             "Network throughput",
                             "Per-interface receive/transmit rates.",
                         );
-                        network_throughput_rows(ui, snapshot);
+                        network_throughput_rows(ui, snapshot, &self.metric_window_samples());
                     });
                 } else {
                     ui.horizontal(|ui| {
@@ -1693,7 +1961,7 @@ impl SentinelDashboard {
                                     "Disk throughput",
                                     "Per-device read/write rates.",
                                 );
-                                disk_throughput_rows(ui, snapshot);
+                                disk_throughput_rows(ui, snapshot, &self.metric_window_samples());
                             });
                         });
                         ui.vertical(|ui| {
@@ -1707,7 +1975,7 @@ impl SentinelDashboard {
                                     "Network throughput",
                                     "Per-interface receive/transmit rates.",
                                 );
-                                network_throughput_rows(ui, snapshot);
+                                network_throughput_rows(ui, snapshot, &self.metric_window_samples());
                             });
                         });
                     });
@@ -1890,6 +2158,52 @@ impl SentinelDashboard {
             ProcessSort::PidAsc => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
             ProcessSort::ThreadsDesc => rows.sort_by(|a, b| b.threads.cmp(&a.threads)),
         }
+        let top_cpu: Vec<(String, f64)> = rows
+            .iter()
+            .take(8)
+            .map(|p| (format!("{} ({})", p.name, p.pid), p.cpu_percent as f64))
+            .collect();
+        let top_rss: Vec<(String, f64)> = rows
+            .iter()
+            .take(8)
+            .map(|p| (format!("{} ({})", p.name, p.pid), p.memory_bytes as f64))
+            .collect();
+        ui.group(|ui| {
+            ui.label(RichText::new("Process analytics").strong());
+            ui.horizontal_wrapped(|ui| {
+                render_horizontal_bar_chart(
+                    ui,
+                    "Top CPU processes",
+                    &top_cpu,
+                    egui::Color32::from_rgb(96, 176, 210),
+                    |v| format!("{v:.1}%"),
+                );
+                render_horizontal_bar_chart(
+                    ui,
+                    "Top RSS processes",
+                    &top_rss,
+                    egui::Color32::from_rgb(196, 158, 66),
+                    |v| human_bytes(v as u64),
+                );
+            });
+            let min_ts = now_unix_secs().saturating_sub(self.time_window.seconds());
+            let churn_points: Vec<(u64, f64)> = self
+                .process_churn_history
+                .iter()
+                .filter(|(ts, _, _)| *ts >= min_ts)
+                .map(|(ts, started, exited)| (*ts, (*started + *exited) as f64))
+                .collect();
+            render_line_chart(
+                ui,
+                "Process churn rate",
+                &churn_points,
+                egui::Color32::from_rgb(220, 176, 64),
+                110.0,
+                |v| format!("{v:.0}/tick"),
+            );
+            let proc_density: Vec<f64> = rows.iter().map(|p| p.cpu_percent as f64).take(48).collect();
+            render_distribution_bins(ui, "CPU distribution", &proc_density, 8);
+        });
         ui.label(
             RichText::new(format!("{} processes shown", rows.len()))
                 .weak()
@@ -1979,6 +2293,64 @@ impl SentinelDashboard {
             ui.label("No audit events yet.");
             return;
         }
+        ui.group(|ui| {
+            ui.label(RichText::new("Audit analytics").strong());
+            let mut by_action: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut hour_bins = [0usize; 24];
+            let mut timeline = Vec::new();
+            for event in self.audit_feed.iter().take(240) {
+                *by_action.entry(event.action.clone()).or_insert(0) += 1;
+                let hour = ((event.ts / 3600) % 24) as usize;
+                hour_bins[hour] += 1;
+                timeline.push((
+                    event.ts,
+                    if event.result.to_ascii_lowercase().contains("denied") {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ));
+            }
+            let bars: Vec<(String, f64)> = by_action
+                .iter()
+                .rev()
+                .take(10)
+                .map(|(k, v)| (k.clone(), *v as f64))
+                .collect();
+            render_horizontal_bar_chart(
+                ui,
+                "Action frequency",
+                &bars,
+                egui::Color32::from_rgb(130, 205, 235),
+                |v| format!("{v:.0}"),
+            );
+            let allow_deny_points: Vec<(u64, f64)> = self
+                .audit_rate_history
+                .iter()
+                .filter(|(ts, _, _)| *ts >= now_unix_secs().saturating_sub(self.time_window.seconds()))
+                .map(|(ts, allow, deny)| {
+                    (
+                        *ts,
+                        if allow + deny == 0 {
+                            0.0
+                        } else {
+                            (*deny as f64 / (*allow + *deny) as f64) * 100.0
+                        },
+                    )
+                })
+                .collect();
+            render_line_chart(
+                ui,
+                "Deny ratio trend",
+                &allow_deny_points,
+                egui::Color32::from_rgb(235, 110, 100),
+                100.0,
+                |v| format!("{v:.0}%"),
+            );
+            render_hour_heatmap(ui, "Audit activity heatmap", &hour_bins);
+            render_timeline(ui, "Audit timeline", &timeline, 70.0);
+        });
 
         let filter = self.audit_filter.trim().to_ascii_lowercase();
         let filtered: Vec<&AuditEvent> = self
@@ -2120,6 +2492,38 @@ impl SentinelDashboard {
             }
         });
         ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Connector analytics").strong());
+            let min_ts = now_unix_secs().saturating_sub(self.time_window.seconds());
+            let peer_points: Vec<(u64, f64)> = self
+                .connector_latency_history
+                .iter()
+                .filter(|(ts, _, _)| *ts >= min_ts)
+                .filter_map(|(ts, pw, _)| pw.map(|v| (*ts, v)))
+                .collect();
+            let evrus_points: Vec<(u64, f64)> = self
+                .connector_latency_history
+                .iter()
+                .filter(|(ts, _, _)| *ts >= min_ts)
+                .filter_map(|(ts, _, ev)| ev.map(|v| (*ts, v)))
+                .collect();
+            render_line_chart(
+                ui,
+                "PeerWeave latency",
+                &peer_points,
+                egui::Color32::from_rgb(96, 176, 210),
+                90.0,
+                |v| format!("{v:.0}ms"),
+            );
+            render_line_chart(
+                ui,
+                "EVRUS latency",
+                &evrus_points,
+                egui::Color32::from_rgb(196, 158, 66),
+                90.0,
+                |v| format!("{v:.0}ms"),
+            );
+        });
 
         if self.connector_summary.entries.is_empty() {
             let passive = self.engine.connector_summary_passive();
@@ -2171,6 +2575,16 @@ impl SentinelDashboard {
                             graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0),
                             graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0)
                         ));
+                        let peers = node
+                            .get("peers")
+                            .and_then(|p| p.get("count"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let graph_nodes =
+                            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let graph_edges =
+                            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                        render_topology_map(ui, peers, graph_nodes, graph_edges);
                         if let Some(spaces) = payload.get("spaces").and_then(|v| v.as_array()) {
                             ui.label(RichText::new("Spaces").strong());
                             if spaces.is_empty() {
@@ -2587,7 +3001,7 @@ impl eframe::App for SentinelDashboard {
     }
 }
 
-fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
+fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot, samples: &[&MetricSample]) {
     if snapshot.disks.is_empty() {
         ui.label(
             egui::RichText::new("No disk devices in this snapshot.")
@@ -2613,6 +3027,31 @@ fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         .font(FontId::new(12.0, FontFamily::Proportional)),
     );
     ui.add_space(4.0);
+    let disk_points: Vec<(u64, f64)> = samples.iter().map(|s| (s.ts, s.disk_bps)).collect();
+    render_line_chart(
+        ui,
+        "Disk throughput trend",
+        &disk_points,
+        egui::Color32::from_rgb(130, 205, 235),
+        90.0,
+        |v| human_bytes(v as u64),
+    );
+    let disk_totals: Vec<(String, f64)> = rows
+        .iter()
+        .map(|d| {
+            (
+                d.device.clone(),
+                d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec) as f64,
+            )
+        })
+        .collect();
+    render_horizontal_bar_chart(
+        ui,
+        "Disk throughput bars",
+        &disk_totals,
+        egui::Color32::from_rgb(86, 145, 181),
+        |v| format!("{}/s", human_bytes(v as u64)),
+    );
     for disk in &rows {
         let total = disk
             .read_bytes_per_sec
@@ -2642,7 +3081,7 @@ fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
     }
 }
 
-fn network_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
+fn network_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot, samples: &[&MetricSample]) {
     if snapshot.network.is_empty() {
         ui.label(
             egui::RichText::new("No network interfaces in this snapshot.")
@@ -2668,6 +3107,31 @@ fn network_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         .font(FontId::new(12.0, FontFamily::Proportional)),
     );
     ui.add_space(4.0);
+    let net_points: Vec<(u64, f64)> = samples.iter().map(|s| (s.ts, s.net_bps)).collect();
+    render_line_chart(
+        ui,
+        "Network throughput trend",
+        &net_points,
+        egui::Color32::from_rgb(220, 176, 64),
+        90.0,
+        |v| human_bytes(v as u64),
+    );
+    let net_totals: Vec<(String, f64)> = rows
+        .iter()
+        .map(|n| {
+            (
+                n.interface.clone(),
+                n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec) as f64,
+            )
+        })
+        .collect();
+    render_horizontal_bar_chart(
+        ui,
+        "Network throughput bars",
+        &net_totals,
+        egui::Color32::from_rgb(196, 158, 66),
+        |v| format!("{}/s", human_bytes(v as u64)),
+    );
     for net in &rows {
         let total = net.rx_bytes_per_sec.saturating_add(net.tx_bytes_per_sec);
         let sev = throughput_severity(total);
@@ -2971,7 +3435,12 @@ fn throughput_panel_heading(
     ui.add_space(6.0);
 }
 
-fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot, detailed_mode: bool) {
+fn render_overview_metrics(
+    ui: &mut egui::Ui,
+    snapshot: &SystemSnapshot,
+    samples: &[&MetricSample],
+    detailed_mode: bool,
+) {
     const MIN_CPU_MEM_COL: f32 = 168.0;
 
     let gap = ui.spacing().item_spacing.x;
@@ -3045,6 +3514,50 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot, detaile
             });
         });
         ui.add_space(6.0);
+        let cpu_points: Vec<(u64, f64)> = samples
+            .iter()
+            .map(|s| (s.ts, s.cpu_pct as f64))
+            .collect();
+        let mem_points: Vec<(u64, f64)> = samples
+            .iter()
+            .map(|s| (s.ts, s.mem_pct as f64))
+            .collect();
+        render_line_chart(
+            ui,
+            "CPU trend",
+            &cpu_points,
+            egui::Color32::from_rgb(96, 176, 210),
+            85.0,
+            |v| format!("{v:.1}%"),
+        );
+        render_line_chart(
+            ui,
+            "Memory trend",
+            &mem_points,
+            egui::Color32::from_rgb(196, 158, 66),
+            85.0,
+            |v| format!("{v:.1}%"),
+        );
+        let process_points: Vec<(u64, f64)> = samples
+            .iter()
+            .map(|s| (s.ts, s.process_count as f64))
+            .collect();
+        render_line_chart(
+            ui,
+            "Process count trend",
+            &process_points,
+            egui::Color32::from_rgb(130, 205, 235),
+            70.0,
+            |v| format!("{v:.0}"),
+        );
+        let cpu_roll = rolling_stats(&cpu_points);
+        ui.label(
+            RichText::new(format!(
+                "CPU window stats: avg {:.1}% · p95 {:.1}% · max {:.1}%",
+                cpu_roll.0, cpu_roll.1, cpu_roll.2
+            ))
+            .weak(),
+        );
     }
 
     if stack_cpu_mem {
@@ -3104,6 +3617,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot, detaile
                     info
                 });
                 memory_overview_extras(ui, &snapshot.memory);
+                render_memory_pie(ui, &snapshot.memory);
             });
         });
     } else {
@@ -3173,6 +3687,7 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot, detaile
                         info
                     });
                     memory_overview_extras(ui, &snapshot.memory);
+                    render_memory_pie(ui, &snapshot.memory);
                 });
             });
         });
@@ -3348,6 +3863,271 @@ fn parse_identity_from_jwt(jwt: &str) -> Option<EvrusIdentity> {
         display_name,
         exp,
     })
+}
+
+fn push_history<T>(buf: &mut VecDeque<T>, value: T, cap: usize) {
+    if buf.len() >= cap {
+        let _ = buf.pop_front();
+    }
+    buf.push_back(value);
+}
+
+fn render_line_chart<F: Fn(f64) -> String>(
+    ui: &mut egui::Ui,
+    title: &str,
+    points: &[(u64, f64)],
+    color: egui::Color32,
+    height: f32,
+    value_fmt: F,
+) {
+    ui.label(RichText::new(title).strong());
+    if points.len() < 2 {
+        ui.label(RichText::new("Waiting for more samples...").weak());
+        return;
+    }
+    let width = ui.available_width().max(140.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let min_x = points.first().map(|p| p.0).unwrap_or(0) as f64;
+    let max_x = points.last().map(|p| p.0).unwrap_or(1) as f64;
+    let min_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let raw_max_y = points
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut max_y = raw_max_y.max(min_y + 1e-6);
+    let mut min_plot_y = min_y;
+    let span = (max_y - min_plot_y).abs();
+    if span < 0.25 {
+        // Make low-variance series more legible instead of visually flat.
+        let pad = 0.125_f64.max(max_y.abs() * 0.01);
+        min_plot_y -= pad;
+        max_y += pad;
+    }
+    let to_screen = |x: u64, y: f64| {
+        let tx = if (max_x - min_x).abs() < f64::EPSILON {
+            0.0_f64
+        } else {
+            (x as f64 - min_x) / (max_x - min_x)
+        };
+        let ty = ((y - min_plot_y) / (max_y - min_plot_y)).clamp(0.0, 1.0);
+        egui::pos2(
+            rect.left() + (tx as f32) * rect.width(),
+            rect.bottom() - (ty as f32) * rect.height(),
+        )
+    };
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, egui::Color32::from_rgb(46, 64, 80)),
+    );
+    for frac in [0.25_f32, 0.5_f32, 0.75_f32] {
+        let y = egui::lerp(rect.top()..=rect.bottom(), frac);
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            Stroke::new(1.0, egui::Color32::from_rgb(30, 44, 58)),
+        );
+    }
+    for line in points.windows(2) {
+        let p0 = to_screen(line[0].0, line[0].1);
+        let p1 = to_screen(line[1].0, line[1].1);
+        ui.painter().line_segment([p0, p1], Stroke::new(2.0, color));
+    }
+    let stride = (points.len() / 40).max(1);
+    for (idx, (x, y)) in points.iter().enumerate() {
+        if idx % stride == 0 || idx + 1 == points.len() {
+            ui.painter()
+                .circle_filled(to_screen(*x, *y), 2.4, color.gamma_multiply(0.9));
+        }
+    }
+    let delta = points.last().map(|v| v.1).unwrap_or(0.0) - points.first().map(|v| v.1).unwrap_or(0.0);
+    ui.label(
+        RichText::new(format!(
+            "min {} · max {} · delta {}",
+            value_fmt(min_y),
+            value_fmt(raw_max_y),
+            value_fmt(delta)
+        ))
+        .weak(),
+    );
+    if response.hovered() {
+        if let Some(last) = points.last() {
+            response.on_hover_text(format!("latest {}", value_fmt(last.1)));
+        }
+    }
+}
+
+fn render_horizontal_bar_chart<F: Fn(f64) -> String>(
+    ui: &mut egui::Ui,
+    title: &str,
+    items: &[(String, f64)],
+    fill: egui::Color32,
+    value_fmt: F,
+) {
+    if items.is_empty() {
+        return;
+    }
+    ui.vertical(|ui| {
+        ui.label(RichText::new(title).strong());
+        let max_val = items
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        for (label, value) in items.iter().take(8) {
+            let ratio = (*value / max_val) as f32;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).small());
+                let pb = egui::ProgressBar::new(ratio)
+                    .desired_width((ui.available_width() - 90.0).max(80.0))
+                    .desired_height(14.0)
+                    .fill(fill)
+                    .text(value_fmt(*value));
+                ui.add(pb);
+            });
+        }
+    });
+}
+
+fn render_distribution_bins(ui: &mut egui::Ui, title: &str, values: &[f64], bins: usize) {
+    if values.is_empty() || bins == 0 {
+        return;
+    }
+    ui.label(RichText::new(title).strong());
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(min + 1e-6);
+    let step = (max - min) / bins as f64;
+    let mut counts = vec![0usize; bins];
+    for value in values {
+        let idx = (((*value - min) / step).floor() as usize).min(bins - 1);
+        counts[idx] += 1;
+    }
+    let bars: Vec<(String, f64)> = counts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (format!("{i}"), *c as f64))
+        .collect();
+    render_horizontal_bar_chart(
+        ui,
+        "Histogram bins",
+        &bars,
+        egui::Color32::from_rgb(130, 205, 235),
+        |v| format!("{v:.0}"),
+    );
+}
+
+fn render_hour_heatmap(ui: &mut egui::Ui, title: &str, bins: &[usize; 24]) {
+    ui.label(RichText::new(title).strong());
+    let max_v = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
+    ui.horizontal_wrapped(|ui| {
+        for (hour, value) in bins.iter().enumerate() {
+            let intensity = (*value as f32 / max_v).clamp(0.0, 1.0);
+            let color = egui::Color32::from_rgb(
+                (30.0 + intensity * 120.0) as u8,
+                (45.0 + intensity * 140.0) as u8,
+                (60.0 + intensity * 150.0) as u8,
+            );
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, color);
+            if resp.hovered() {
+                resp.on_hover_text(format!("hour {:02}: {} events", hour, value));
+            }
+        }
+    });
+}
+
+fn render_timeline(ui: &mut egui::Ui, title: &str, points: &[(u64, f64)], height: f32) {
+    ui.label(RichText::new(title).strong());
+    if points.is_empty() {
+        return;
+    }
+    let width = ui.available_width().max(120.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let min_ts = points.first().map(|p| p.0).unwrap_or(0);
+    let max_ts = points.last().map(|p| p.0).unwrap_or(min_ts + 1).max(min_ts + 1);
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, egui::Color32::from_rgb(46, 64, 80)),
+    );
+    for (ts, mark) in points.iter().take(160) {
+        let t = (*ts - min_ts) as f32 / (max_ts - min_ts) as f32;
+        let x = rect.left() + t * rect.width();
+        let color = if *mark > 0.5 {
+            egui::Color32::from_rgb(225, 90, 90)
+        } else {
+            egui::Color32::from_rgb(96, 176, 210)
+        };
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.top() + 4.0), egui::pos2(x, rect.bottom() - 4.0)],
+            Stroke::new(1.0, color),
+        );
+    }
+}
+
+fn render_topology_map(ui: &mut egui::Ui, peers: u64, nodes: u64, edges: u64) {
+    ui.label(RichText::new("Topology map").strong());
+    let width = ui.available_width().max(200.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 120.0), egui::Sense::hover());
+    let center = egui::pos2(rect.center().x, rect.center().y);
+    ui.painter().circle_filled(center, 14.0, egui::Color32::from_rgb(96, 176, 210));
+    let n = peers.clamp(1, 10) as usize;
+    for idx in 0..n {
+        let angle = (idx as f32 / n as f32) * std::f32::consts::TAU;
+        let p = egui::pos2(center.x + angle.cos() * 40.0, center.y + angle.sin() * 34.0);
+        ui.painter().line_segment([center, p], Stroke::new(1.0, egui::Color32::from_rgb(130, 205, 235)));
+        ui.painter().circle_filled(p, 6.0, egui::Color32::from_rgb(196, 158, 66));
+    }
+    ui.label(RichText::new(format!("peers={peers} nodes={nodes} edges={edges}")).weak());
+}
+
+fn render_memory_pie(ui: &mut egui::Ui, m: &crate::models::memory::MemoryMetrics) {
+    if m.total == 0 {
+        return;
+    }
+    ui.label(RichText::new("Memory composition").strong());
+    let used = m.used.min(m.total);
+    let available = m.available.min(m.total.saturating_sub(used));
+    let other = m.total.saturating_sub(used).saturating_sub(available);
+    let segments = [
+        ("used", used, egui::Color32::from_rgb(220, 116, 78)),
+        ("available", available, egui::Color32::from_rgb(96, 176, 210)),
+        ("other", other, egui::Color32::from_rgb(120, 140, 165)),
+    ];
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(140.0, 140.0), egui::Sense::hover());
+    let center = rect.center();
+    let radius = 50.0;
+    let mut start = 0.0_f32;
+    for (name, value, color) in segments {
+        let frac = value as f32 / m.total as f32;
+        let sweep = frac * std::f32::consts::TAU;
+        let end = start + sweep;
+        let mut points = vec![center];
+        let steps = 24usize.max((sweep.abs() * 24.0) as usize);
+        for i in 0..=steps {
+            let a = start + (end - start) * (i as f32 / steps as f32);
+            points.push(egui::pos2(center.x + radius * a.cos(), center.y + radius * a.sin()));
+        }
+        ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+        ui.label(RichText::new(format!("{name}: {}", human_bytes(value))).small());
+        start = end;
+    }
+}
+
+fn rolling_stats(points: &[(u64, f64)]) -> (f64, f64, f64) {
+    if points.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut values: Vec<f64> = points.iter().map(|(_, v)| *v).collect();
+    values.sort_by(|a, b| a.total_cmp(b));
+    let avg = values.iter().sum::<f64>() / values.len() as f64;
+    let idx = ((values.len() as f64) * 0.95).floor() as usize;
+    let p95 = values[idx.min(values.len() - 1)];
+    let max = *values.last().unwrap_or(&0.0);
+    (avg, p95, max)
 }
 
 fn human_bytes(bytes: u64) -> String {
