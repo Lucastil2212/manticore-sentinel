@@ -39,6 +39,8 @@ pub struct RuntimeConfig {
     pub privileged: bool,
     pub helper_mode: String,
     pub refresh_ms: u64,
+    pub process_max_entries: usize,
+    pub process_cmdline_entries: usize,
     pub auth_mode: AuthMode,
     pub role: Role,
     pub auth_token: Option<String>,
@@ -65,6 +67,10 @@ pub struct EventStreamConfig {
 pub struct SnapshotHistoryConfig {
     pub enabled: bool,
     pub max_entries: usize,
+    pub max_age_secs: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub slim_records: bool,
+    pub reset_on_start: bool,
 }
 
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
@@ -150,13 +156,23 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         .map(|v| v.parse::<u64>())
         .transpose()
         .map_err(|_| anyhow::anyhow!("MANTICORE_REFRESH_MS must be an integer"))?
-        .unwrap_or(500);
+        .unwrap_or(1000);
     if !(100..=5000).contains(&refresh_ms) {
         return Err(anyhow::anyhow!(
             "MANTICORE_REFRESH_MS out of range (100..=5000): {}",
             refresh_ms
         ));
     }
+    let process_max_entries = std::env::var("MANTICORE_PROCESS_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(120)
+        .clamp(20, 2000);
+    let process_cmdline_entries = std::env::var("MANTICORE_PROCESS_CMDLINE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(24)
+        .clamp(0, process_max_entries);
 
     let connectors = load_connector_config(&auth_mode);
     if auth_mode == AuthMode::Evrus {
@@ -192,12 +208,24 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         None
     };
     let snapshot_history = SnapshotHistoryConfig {
-        enabled: parse_bool_env("MANTICORE_SNAPSHOT_HISTORY_ENABLED", true).unwrap_or(true),
+        enabled: parse_bool_env("MANTICORE_SNAPSHOT_HISTORY_ENABLED", false).unwrap_or(false),
         max_entries: std::env::var("MANTICORE_SNAPSHOT_HISTORY_MAX_ENTRIES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(5000)
+            .unwrap_or(1000)
             .clamp(100, 200_000),
+        max_age_secs: std::env::var("MANTICORE_SNAPSHOT_HISTORY_MAX_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0),
+        max_bytes: std::env::var("MANTICORE_SNAPSHOT_HISTORY_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0),
+        slim_records: parse_bool_env("MANTICORE_SNAPSHOT_HISTORY_SLIM_RECORDS", false)
+            .unwrap_or(false),
+        reset_on_start: parse_bool_env("MANTICORE_SNAPSHOT_HISTORY_RESET_ON_START", false)
+            .unwrap_or(false),
     };
     let audit_retention = {
         let max_entries = std::env::var("MANTICORE_AUDIT_MAX_ENTRIES")
@@ -218,6 +246,8 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         privileged,
         helper_mode,
         refresh_ms,
+        process_max_entries,
+        process_cmdline_entries,
         auth_mode,
         role,
         auth_token,

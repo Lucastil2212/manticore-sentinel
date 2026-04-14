@@ -331,8 +331,8 @@ pub fn merkle_root_from_state(state: &MerkleState) -> Option<String> {
         .map(|hex| {
             let mut buf = [0u8; 32];
             for (i, chunk) in hex.as_bytes().chunks(2).enumerate().take(32) {
-                buf[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16)
-                    .unwrap_or(0);
+                buf[i] =
+                    u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16).unwrap_or(0);
             }
             buf
         })

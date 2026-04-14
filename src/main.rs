@@ -20,6 +20,8 @@ fn main() -> anyhow::Result<()> {
         privileged = config.privileged,
         helper_mode = %config.helper_mode,
         refresh_ms = config.refresh_ms,
+        process_max_entries = config.process_max_entries,
+        process_cmdline_entries = config.process_cmdline_entries,
         "startup diagnostics"
     );
     if args.iter().any(|arg| arg == "--helper-daemon") {
@@ -85,7 +87,10 @@ fn load_profile_env(profile: &str) -> anyhow::Result<()> {
 fn run_benchmark_mode(config: &core::config::RuntimeConfig) -> anyhow::Result<()> {
     use std::time::Instant;
 
-    let mut engine = core::engine::SentinelEngine::new();
+    let mut engine = core::engine::SentinelEngine::new(
+        config.process_max_entries,
+        config.process_cmdline_entries,
+    );
     engine.init_connectors(&config.connectors);
     let runtime = tokio::runtime::Runtime::new()?;
     let iterations = 40u32;

@@ -15,9 +15,12 @@ pub struct SentinelEngine {
 }
 
 impl SentinelEngine {
-    pub fn new() -> Self {
+    pub fn new(process_max_entries: usize, process_cmdline_entries: usize) -> Self {
         Self {
-            host_collectors: vec![Box::new(LocalHostCollector::new())],
+            host_collectors: vec![Box::new(LocalHostCollector::new(
+                process_max_entries,
+                process_cmdline_entries,
+            ))],
             primary_host_idx: 0,
             ecosystem_connectors: Vec::new(),
             connector_poll_counter: 0,
@@ -75,7 +78,7 @@ struct LocalHostCollector {
 }
 
 impl LocalHostCollector {
-    fn new() -> Self {
+    fn new(process_max_entries: usize, process_cmdline_entries: usize) -> Self {
         let host_id = std::env::var("HOSTNAME")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -84,7 +87,7 @@ impl LocalHostCollector {
             host_id,
             cpu: CpuCollector::new(),
             memory: MemoryCollector::new(),
-            process: ProcessCollector::new(),
+            process: ProcessCollector::new(process_max_entries, process_cmdline_entries),
             disk: DiskCollector::new(),
             network: NetworkCollector::new(),
         }
@@ -159,9 +162,5 @@ impl SentinelEngine {
 
     pub fn has_connectors(&self) -> bool {
         !self.ecosystem_connectors.is_empty()
-    }
-
-    pub fn connector_poll_counter(&self) -> u64 {
-        self.connector_poll_counter
     }
 }

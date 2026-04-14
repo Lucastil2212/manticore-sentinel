@@ -20,6 +20,10 @@ Profiles are loaded from `config/profiles/<name>.env`.
   - Optional PeerWeave graph publish path is scaffolded (disabled by default)
   - Evrmore audit anchoring enabled (RPC credentials required)
   - Local snapshot history persistence enabled (`.beads/state/snapshots.jsonl`)
+  - Snapshot history capped at 1000 entries by default
+  - Optional snapshot age/size caps via `MANTICORE_SNAPSHOT_HISTORY_MAX_AGE_SECS` and `MANTICORE_SNAPSHOT_HISTORY_MAX_BYTES`
+  - Optional slim history rows via `MANTICORE_SNAPSHOT_HISTORY_SLIM_RECORDS=true`
+  - Optional startup reset with `MANTICORE_SNAPSHOT_HISTORY_RESET_ON_START=true`
   - Optional alert policy scaffold via `MANTICORE_ALERT_POLICY_JSON` or `MANTICORE_ALERT_POLICY_PATH`
 
 ## Examples
@@ -36,3 +40,4 @@ Profiles are loaded from `config/profiles/<name>.env`.
 - Explicit environment variables in your shell can still override behavior if set after profile loading.
 - Profile files are plain key-value env declarations with `#` comments supported.
 - `ecosystem` profile includes placeholder secrets/tokens; replace before use.
+- Global defaults keep snapshot history disabled unless explicitly enabled by profile or env var.

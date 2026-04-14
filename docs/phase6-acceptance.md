@@ -18,6 +18,7 @@ Phase 6 focuses on enterprise platform expansion:
 1. Historical snapshot persistence
    - Local JSONL snapshot history at `.beads/state/snapshots.jsonl`
    - Bounded retention via `MANTICORE_SNAPSHOT_HISTORY_MAX_ENTRIES`
+   - Optional age and size compaction via `MANTICORE_SNAPSHOT_HISTORY_MAX_AGE_SECS` and `MANTICORE_SNAPSHOT_HISTORY_MAX_BYTES`
    - Recent-window read path for trend context (`HIST 1H` quick tile)
 
 2. Multi-host abstraction groundwork
@@ -60,7 +61,7 @@ Phase 6 focuses on enterprise platform expansion:
 ## Rollout plan
 
 1. Enable snapshot history in non-prod first
-   - Keep defaults (`enabled=true`, bounded entries)
+   - Keep defaults (`enabled=false`, bounded entries when enabled)
    - Observe file growth and I/O impact under representative refresh rates
 
 2. Trial alert policy in staging

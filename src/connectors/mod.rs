@@ -7,8 +7,6 @@ use std::fmt;
 /// Runtime status of an ecosystem connector.
 #[derive(Debug, Clone)]
 pub enum ConnectorStatus {
-    /// Connector not configured / feature disabled.
-    Disabled,
     /// Connection attempt in progress.
     Connecting,
     /// Connected and receiving data.
@@ -22,22 +20,10 @@ pub enum ConnectorStatus {
 impl ConnectorStatus {
     pub fn label(&self) -> &str {
         match self {
-            Self::Disabled => "DISABLED",
             Self::Connecting => "CONNECTING",
             Self::Healthy => "HEALTHY",
             Self::Degraded(_) => "DEGRADED",
             Self::Failed(_) => "FAILED",
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        !matches!(self, Self::Disabled)
-    }
-
-    pub fn detail(&self) -> Option<&str> {
-        match self {
-            Self::Degraded(d) | Self::Failed(d) => Some(d.as_str()),
-            _ => None,
         }
     }
 }
@@ -45,7 +31,6 @@ impl ConnectorStatus {
 impl fmt::Display for ConnectorStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Disabled => write!(f, "DISABLED"),
             Self::Connecting => write!(f, "CONNECTING"),
             Self::Healthy => write!(f, "HEALTHY"),
             Self::Degraded(d) => write!(f, "DEGRADED: {d}"),
@@ -67,7 +52,6 @@ pub struct ConnectorHealth {
 #[derive(Debug, Clone)]
 pub struct ConnectorSnapshot {
     pub name: String,
-    pub timestamp: u64,
     pub data: serde_json::Value,
 }
 
@@ -92,10 +76,6 @@ pub struct ConnectorSummary {
 }
 
 impl ConnectorSummary {
-    pub fn any_active(&self) -> bool {
-        self.entries.iter().any(|e| e.status.is_active())
-    }
-
     pub fn health_for(&self, name: &str) -> Option<&ConnectorHealth> {
         self.entries
             .iter()

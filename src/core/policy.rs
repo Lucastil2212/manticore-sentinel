@@ -135,10 +135,16 @@ impl ExecutionPolicy {
         }
         if let Ok(path) = std::env::var("MANTICORE_EVRUS_POLICY_PATH") {
             match std::fs::read_to_string(&path) {
-                Err(_) => warnings.push(format!("MANTICORE_EVRUS_POLICY_PATH '{}' not readable", path)),
+                Err(_) => warnings.push(format!(
+                    "MANTICORE_EVRUS_POLICY_PATH '{}' not readable",
+                    path
+                )),
                 Ok(raw) => {
                     if serde_json::from_str::<SystemActionPolicy>(&raw).is_err() {
-                        warnings.push(format!("MANTICORE_EVRUS_POLICY_PATH '{}' contains invalid JSON", path));
+                        warnings.push(format!(
+                            "MANTICORE_EVRUS_POLICY_PATH '{}' contains invalid JSON",
+                            path
+                        ));
                     }
                 }
             }
@@ -150,10 +156,16 @@ impl ExecutionPolicy {
         }
         if let Ok(path) = std::env::var("MANTICORE_ALERT_POLICY_PATH") {
             match std::fs::read_to_string(&path) {
-                Err(_) => warnings.push(format!("MANTICORE_ALERT_POLICY_PATH '{}' not readable", path)),
+                Err(_) => warnings.push(format!(
+                    "MANTICORE_ALERT_POLICY_PATH '{}' not readable",
+                    path
+                )),
                 Ok(raw) => {
                     if serde_json::from_str::<AlertPolicy>(&raw).is_err() {
-                        warnings.push(format!("MANTICORE_ALERT_POLICY_PATH '{}' contains invalid JSON", path));
+                        warnings.push(format!(
+                            "MANTICORE_ALERT_POLICY_PATH '{}' contains invalid JSON",
+                            path
+                        ));
                     }
                 }
             }

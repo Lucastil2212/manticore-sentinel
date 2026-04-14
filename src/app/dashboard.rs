@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -8,16 +8,19 @@ use egui_extras::install_image_loaders;
 use tokio::runtime::Runtime;
 
 use crate::connectors::ConnectorSummary;
+use crate::core::config::{AuditRetentionConfig, ConfigWarning};
 use crate::core::{
     command::{parse_command, CommandAction},
     config::load_runtime_config,
     engine::SentinelEngine,
-    history::{append_snapshot, default_snapshot_history_path, read_since},
+    history::{
+        append_snapshot, count_since, default_snapshot_history_path,
+        reset as reset_snapshot_history, SnapshotHistoryRetention,
+    },
     policy::{AlertMatch, AlertSeverity, ExecutionPolicy},
     snapshot::SystemSnapshot,
 };
 use crate::models::process::ProcessMetrics;
-use crate::core::config::{AuditRetentionConfig, ConfigWarning};
 use crate::security::audit::{
     anchor_audit_if_due, append_event_with_retention, audit_archive_stats, audit_entry_count,
     current_merkle_root, default_audit_path, load_anchor_state, now_ts, read_from_offset,
@@ -33,54 +36,12 @@ use super::icons;
 
 const ID_COMMAND_INPUT: &str = "command_palette_input";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DashboardView {
-    System,
-    Processes,
-    Network,
-    PeerWeave,
-    Evrus,
-    Audit,
-    Connectors,
-}
-
-impl DashboardView {
-    fn all() -> [DashboardView; 7] {
-        [
-            DashboardView::System,
-            DashboardView::Processes,
-            DashboardView::Network,
-            DashboardView::PeerWeave,
-            DashboardView::Evrus,
-            DashboardView::Audit,
-            DashboardView::Connectors,
-        ]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DashboardView::System => "System",
-            DashboardView::Processes => "Processes",
-            DashboardView::Network => "Network",
-            DashboardView::PeerWeave => "PeerWeave",
-            DashboardView::Evrus => "EVRUS",
-            DashboardView::Audit => "Audit",
-            DashboardView::Connectors => "Connectors",
-        }
-    }
-
-    fn help(self) -> &'static str {
-        match self {
-            DashboardView::System => "Overview + control shell + activity feed.",
-            DashboardView::Processes => "Dedicated process inspection with sortable table.",
-            DashboardView::Network => "Focused interface and throughput analysis.",
-            DashboardView::PeerWeave => "PeerWeave connector health and graph context.",
-            DashboardView::Evrus => "EVRUS identity, auth, and anchoring posture.",
-            DashboardView::Audit => "Chronological audit trail with filtering and anchor metadata.",
-            DashboardView::Connectors => "Integration health matrix for all connectors.",
-        }
-    }
-}
+const SECTION_OVERVIEW: &str = "overview";
+const SECTION_DISK_NET: &str = "disk_net";
+const SECTION_CONTROL: &str = "control_activity";
+const SECTION_PROCESSES: &str = "processes";
+const SECTION_AUDIT: &str = "audit";
+const SECTION_CONNECTORS: &str = "connectors";
 
 fn filtered_command_completions(typed: &str) -> Vec<&'static str> {
     let low = typed.trim_start().to_ascii_lowercase();
@@ -99,6 +60,8 @@ pub struct SentinelDashboard {
     runtime: Runtime,
     latest: Option<SystemSnapshot>,
     last_poll: Instant,
+    poll_interval: Duration,
+    ui_repaint_interval: Duration,
     last_error: Option<String>,
     command_input: String,
     auth_token_input: String,
@@ -130,7 +93,8 @@ pub struct SentinelDashboard {
     connector_summary: ConnectorSummary,
     last_connector_poll: Instant,
     connector_poll_interval: Duration,
-    active_view: DashboardView,
+    collapsed_sections: HashSet<&'static str>,
+    scroll_to_section: Option<&'static str>,
     token_lifecycle: Option<TokenLifecycle>,
     evrus_jwt: Option<String>,
     anchor_state: AnchorState,
@@ -145,6 +109,10 @@ pub struct SentinelDashboard {
     last_event_stream_audit_poll: Instant,
     snapshot_history_enabled: bool,
     snapshot_history_max_entries: usize,
+    snapshot_history_max_age_secs: Option<u64>,
+    snapshot_history_max_bytes: Option<u64>,
+    snapshot_history_slim_records: bool,
+    snapshot_history_reset_on_start: bool,
     snapshot_history_path: std::path::PathBuf,
     snapshot_history_recent_hour: usize,
     last_snapshot_history_probe: Instant,
@@ -157,7 +125,6 @@ pub struct SentinelDashboard {
     audit_retention: AuditRetentionConfig,
     config_warnings: Vec<ConfigWarning>,
     config_warnings_dismissed: bool,
-    show_view_help: bool,
     show_connector_wizard: bool,
     wizard_step: usize,
     wizard_connector_type: usize,
@@ -242,11 +209,13 @@ impl SentinelDashboard {
         };
         let auth_gate = AuthGate::new(auth, cfg.auth_token.clone(), cfg.token_lifecycle);
         let mut runtime_diagnostics = format!(
-            "profile={} privileged={} helper_mode={} refresh_ms={} role={} auth_mode={} token_ttl_secs={} peerweave={} evrus={}",
+            "profile={} privileged={} helper_mode={} refresh_ms={} proc_max={} proc_cmdline={} role={} auth_mode={} token_ttl_secs={} peerweave={} evrus={}",
             cfg.profile,
             cfg.privileged,
             cfg.helper_mode,
             cfg.refresh_ms,
+            cfg.process_max_entries,
+            cfg.process_cmdline_entries,
             cfg.role.as_str(),
             cfg.auth_mode.as_str(),
             cfg.token_lifecycle.map(|t| t.ttl_secs).unwrap_or(0),
@@ -273,8 +242,11 @@ impl SentinelDashboard {
             .unwrap_or(Duration::from_secs(300));
         let anchor_state = load_anchor_state(&audit_path).unwrap_or_default();
         let snapshot_history_path = default_snapshot_history_path(&cwd);
+        if cfg.snapshot_history.enabled && cfg.snapshot_history.reset_on_start {
+            reset_snapshot_history(&snapshot_history_path)?;
+        }
 
-        let mut engine = SentinelEngine::new();
+        let mut engine = SentinelEngine::new(cfg.process_max_entries, cfg.process_cmdline_entries);
         engine.init_connectors(&cfg.connectors);
         runtime_diagnostics = format!("{runtime_diagnostics} hosts={}", engine.host_count());
         let connector_poll_interval = cfg
@@ -303,11 +275,16 @@ impl SentinelDashboard {
             .ok()
         });
 
+        let poll_interval = Duration::from_millis(cfg.refresh_ms);
+        let ui_repaint_interval = Duration::from_millis(cfg.refresh_ms.clamp(250, 1500));
+
         Ok(Self {
             engine,
             runtime: Runtime::new()?,
             latest: None,
-            last_poll: Instant::now() - Duration::from_millis(500),
+            last_poll: Instant::now() - poll_interval,
+            poll_interval,
+            ui_repaint_interval,
             last_error: None,
             command_input: String::new(),
             auth_token_input: String::new(),
@@ -335,7 +312,14 @@ impl SentinelDashboard {
             connector_summary: ConnectorSummary::default(),
             last_connector_poll: Instant::now() - Duration::from_secs(60),
             connector_poll_interval,
-            active_view: DashboardView::System,
+            collapsed_sections: {
+                let mut s = HashSet::new();
+                s.insert(SECTION_DISK_NET);
+                s.insert(SECTION_AUDIT);
+                s.insert(SECTION_CONNECTORS);
+                s
+            },
+            scroll_to_section: None,
             token_lifecycle,
             evrus_jwt,
             anchor_state,
@@ -350,6 +334,10 @@ impl SentinelDashboard {
             last_event_stream_audit_poll: Instant::now() - Duration::from_secs(5),
             snapshot_history_enabled: cfg.snapshot_history.enabled,
             snapshot_history_max_entries: cfg.snapshot_history.max_entries,
+            snapshot_history_max_age_secs: cfg.snapshot_history.max_age_secs,
+            snapshot_history_max_bytes: cfg.snapshot_history.max_bytes,
+            snapshot_history_slim_records: cfg.snapshot_history.slim_records,
+            snapshot_history_reset_on_start: cfg.snapshot_history.reset_on_start,
             snapshot_history_path,
             snapshot_history_recent_hour: 0,
             last_snapshot_history_probe: Instant::now() - Duration::from_secs(10),
@@ -362,7 +350,6 @@ impl SentinelDashboard {
             audit_retention: cfg.audit_retention.clone(),
             config_warnings: all_warnings,
             config_warnings_dismissed: false,
-            show_view_help: false,
             show_connector_wizard: false,
             wizard_step: 0,
             wizard_connector_type: 0,
@@ -381,7 +368,7 @@ impl SentinelDashboard {
     }
 
     fn poll(&mut self) {
-        if self.last_poll.elapsed() < Duration::from_millis(500) {
+        if self.last_poll.elapsed() < self.poll_interval {
             return;
         }
         self.last_poll = Instant::now();
@@ -402,7 +389,12 @@ impl SentinelDashboard {
                     if let Err(err) = append_snapshot(
                         &self.snapshot_history_path,
                         &snapshot,
-                        self.snapshot_history_max_entries,
+                        SnapshotHistoryRetention {
+                            max_entries: self.snapshot_history_max_entries,
+                            max_age_secs: self.snapshot_history_max_age_secs,
+                            max_bytes: self.snapshot_history_max_bytes,
+                            slim_records: self.snapshot_history_slim_records,
+                        },
                     ) {
                         self.last_error = Some(format!("snapshot persistence failed: {err}"));
                         self.self_errors_total = self.self_errors_total.saturating_add(1);
@@ -487,12 +479,12 @@ impl SentinelDashboard {
         }
 
         if self.snapshot_history_enabled
-            && self.last_snapshot_history_probe.elapsed() >= Duration::from_secs(10)
+            && self.last_snapshot_history_probe.elapsed() >= Duration::from_secs(30)
         {
             let now = now_unix_secs();
             let min_ts = now.saturating_sub(3600);
-            match read_since(&self.snapshot_history_path, min_ts) {
-                Ok(rows) => self.snapshot_history_recent_hour = rows.len(),
+            match count_since(&self.snapshot_history_path, min_ts) {
+                Ok(count) => self.snapshot_history_recent_hour = count,
                 Err(err) => {
                     self.last_error = Some(format!("snapshot history query failed: {err}"));
                     self.self_errors_total = self.self_errors_total.saturating_add(1);
@@ -573,19 +565,6 @@ impl SentinelDashboard {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
             ctx.memory_mut(|m| m.request_focus(cmd_focus_id));
         }
-
-        let alt = ctx.input(|i| i.modifiers.alt);
-        if alt && ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
-            self.active_view = DashboardView::System;
-        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num2)) {
-            self.active_view = DashboardView::Processes;
-        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num3)) {
-            self.active_view = DashboardView::Network;
-        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num4)) {
-            self.active_view = DashboardView::Audit;
-        } else if alt && ctx.input(|i| i.key_pressed(egui::Key::Num5)) {
-            self.active_view = DashboardView::Connectors;
-        }
     }
 
     fn execute_read_only_command(&self, action: &CommandAction) -> Option<String> {
@@ -610,7 +589,9 @@ impl SentinelDashboard {
                 let snap = self.latest.as_ref()?;
                 let mut out = String::from("Disk throughput:\n");
                 let mut sorted: Vec<_> = snap.disks.iter().collect();
-                sorted.sort_by_key(|d| std::cmp::Reverse(d.read_bytes_per_sec + d.write_bytes_per_sec));
+                sorted.sort_by_key(|d| {
+                    std::cmp::Reverse(d.read_bytes_per_sec + d.write_bytes_per_sec)
+                });
                 for d in &sorted {
                     out.push_str(&format!(
                         "  {} R:{}/s W:{}/s\n",
@@ -646,7 +627,11 @@ impl SentinelDashboard {
                     _ => procs.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
                 }
                 let lim = limit.unwrap_or(20);
-                let mut out = format!("Processes (top {} by {}):\n", lim, sort.as_deref().unwrap_or("cpu"));
+                let mut out = format!(
+                    "Processes (top {} by {}):\n",
+                    lim,
+                    sort.as_deref().unwrap_or("cpu")
+                );
                 out.push_str("  PID      CPU%    RSS          Name\n");
                 for p in procs.iter().take(lim) {
                     out.push_str(&format!(
@@ -674,15 +659,57 @@ impl SentinelDashboard {
             }
             CommandAction::ShowConfig => {
                 let mut out = String::from("Effective configuration:\n");
-                out.push_str(&format!("  profile:           {}\n", self.runtime_diagnostics));
+                out.push_str(&format!(
+                    "  profile:           {}\n",
+                    self.runtime_diagnostics
+                ));
                 out.push_str(&format!("  auth_mode:         {}\n", self.auth_mode_label));
                 out.push_str(&format!("  role:              {}\n", self.role_label));
                 out.push_str(&format!("  trust:             {}\n", self.trust_state));
-                out.push_str(&format!("  audit_max_entries: {}\n", self.audit_retention.max_entries));
-                out.push_str(&format!("  audit_archive:     {}\n", self.audit_retention.archive_enabled));
-                out.push_str(&format!("  history_enabled:   {}\n", self.snapshot_history_enabled));
-                out.push_str(&format!("  history_max:       {}\n", self.snapshot_history_max_entries));
-                out.push_str(&format!("  sse:               {}\n", if self.event_stream.is_some() { "on" } else { "off" }));
+                out.push_str(&format!(
+                    "  audit_max_entries: {}\n",
+                    self.audit_retention.max_entries
+                ));
+                out.push_str(&format!(
+                    "  audit_archive:     {}\n",
+                    self.audit_retention.archive_enabled
+                ));
+                out.push_str(&format!(
+                    "  history_enabled:   {}\n",
+                    self.snapshot_history_enabled
+                ));
+                out.push_str(&format!(
+                    "  history_max:       {}\n",
+                    self.snapshot_history_max_entries
+                ));
+                out.push_str(&format!(
+                    "  history_reset:     {}\n",
+                    self.snapshot_history_reset_on_start
+                ));
+                out.push_str(&format!(
+                    "  history_max_age:   {}\n",
+                    self.snapshot_history_max_age_secs
+                        .map(|v| format!("{v}s"))
+                        .unwrap_or_else(|| "off".to_string())
+                ));
+                out.push_str(&format!(
+                    "  history_max_bytes: {}\n",
+                    self.snapshot_history_max_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "off".to_string())
+                ));
+                out.push_str(&format!(
+                    "  history_slim:      {}\n",
+                    self.snapshot_history_slim_records
+                ));
+                out.push_str(&format!(
+                    "  sse:               {}\n",
+                    if self.event_stream.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
                 if !self.config_warnings.is_empty() {
                     out.push_str("\n  Warnings:\n");
                     for w in &self.config_warnings {
@@ -733,14 +760,42 @@ impl SentinelDashboard {
                 let audit_path = default_audit_path(&cwd);
                 let audit_size = std::fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
                 let entries = audit_entry_count(&audit_path);
-                let snap_size = std::fs::metadata(&self.snapshot_history_path).map(|m| m.len()).unwrap_or(0);
+                let snap_size = std::fs::metadata(&self.snapshot_history_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 let (arc_count, arc_bytes) = audit_archive_stats(&audit_path);
                 let mut out = String::from("Storage health:\n");
-                out.push_str(&format!("  audit events:   {} entries, {}\n", entries, format_bytes(audit_size)));
-                out.push_str(&format!("  audit max:      {}\n", self.audit_retention.max_entries));
-                out.push_str(&format!("  audit archive:  {} files, {}\n", arc_count, format_bytes(arc_bytes)));
+                out.push_str(&format!(
+                    "  audit events:   {} entries, {}\n",
+                    entries,
+                    format_bytes(audit_size)
+                ));
+                out.push_str(&format!(
+                    "  audit max:      {}\n",
+                    self.audit_retention.max_entries
+                ));
+                out.push_str(&format!(
+                    "  audit archive:  {} files, {}\n",
+                    arc_count,
+                    format_bytes(arc_bytes)
+                ));
                 out.push_str(&format!("  snapshots:      {}\n", format_bytes(snap_size)));
-                out.push_str(&format!("  snapshot max:   {}\n", self.snapshot_history_max_entries));
+                out.push_str(&format!(
+                    "  snapshot max:   {}\n",
+                    self.snapshot_history_max_entries
+                ));
+                out.push_str(&format!(
+                    "  snapshot max age: {}\n",
+                    self.snapshot_history_max_age_secs
+                        .map(|v| format!("{v}s"))
+                        .unwrap_or_else(|| "off".to_string())
+                ));
+                out.push_str(&format!(
+                    "  snapshot max bytes: {}\n",
+                    self.snapshot_history_max_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "off".to_string())
+                ));
                 Some(out)
             }
             CommandAction::Help { topic } => {
@@ -1279,7 +1334,7 @@ impl SentinelDashboard {
                     let out_text = egui::Color32::from_rgb(232, 238, 246);
                     egui::ScrollArea::vertical()
                         .id_source("command_output_scroll")
-                        .max_height(280.0)
+                        .max_height(420.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                     let status = ui
@@ -1312,7 +1367,7 @@ impl SentinelDashboard {
             ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .id_source("session_cmd_history_scroll")
-                .max_height(140.0)
+                .max_height(200.0)
                 .auto_shrink([true, true])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -1490,10 +1545,7 @@ impl SentinelDashboard {
                             self.wizard_url
                         );
                         if !self.wizard_token.is_empty() {
-                            s.push_str(&format!(
-                                "MANTICORE_EVRUS_JWT={}\n",
-                                self.wizard_token
-                            ));
+                            s.push_str(&format!("MANTICORE_EVRUS_JWT={}\n", self.wizard_token));
                         }
                         s
                     }
@@ -1568,7 +1620,7 @@ impl SentinelDashboard {
             ui.heading("Recent Audit Events")
                 .on_hover_text("Append-only trail for helper and auth-gate outcomes.");
         });
-        if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
+        if self.last_audit_refresh.elapsed() >= Duration::from_secs(2) {
             self.audit_feed = read_recent(&self.helper.audit_path, 12).unwrap_or_default();
             self.last_audit_refresh = Instant::now();
         }
@@ -1591,106 +1643,9 @@ impl SentinelDashboard {
         }
     }
 
-    fn render_connectors_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "connectors-network", icons::NETWORK, 18.0);
-            ui.heading("Ecosystem Connectors");
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("PeerWeave and EVRUS integration status.").weak());
-            if ui
-                .small_button("Setup Wizard")
-                .on_hover_text("Open guided connector setup")
-                .clicked()
-            {
-                self.show_connector_wizard = true;
-                self.wizard_step = 0;
-            }
-        });
-        ui.add_space(8.0);
-
-        if self.connector_summary.entries.is_empty() {
-            let passive = self.engine.connector_summary_passive();
-            if passive.entries.is_empty() {
-                ui.label("No connectors configured.");
-                ui.monospace(
-                    "Set MANTICORE_PEERWEAVE_ENABLED=true or MANTICORE_EVRUS_ENABLED=true to enable integrations.",
-                );
-                return;
-            }
-            for entry in &passive.entries {
-                self.render_connector_row(ui, entry);
-            }
-        } else {
-            for entry in &self.connector_summary.entries {
-                self.render_connector_row(ui, entry);
-            }
-        }
-        ui.separator();
-        ui.label(RichText::new("Self-health telemetry").strong());
-        ui.monospace(format!(
-            "collect_last_ms={:.3} collect_avg_ms={:.3} cycles={} connector_polls={}",
-            self.self_collect_last_ms,
-            self.self_collect_avg_ms,
-            self.self_collect_cycles,
-            self.self_connector_polls
-        ));
-        ui.monospace(format!(
-            "alerts_active={} errors_total={} last_error_ts={}",
-            self.latest_alerts.len(),
-            self.self_errors_total,
-            self.self_last_error_ts
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        ));
-
-        ui.separator();
-        ui.label(RichText::new("Storage health").strong());
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let audit_path = default_audit_path(&cwd);
-        let snapshot_path = &self.snapshot_history_path;
-
-        let audit_size = std::fs::metadata(&audit_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let audit_entries = audit_entry_count(&audit_path);
-        let snapshot_size = std::fs::metadata(snapshot_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let (archive_count, archive_bytes) = audit_archive_stats(&audit_path);
-
-        ui.monospace(format!(
-            "audit: {} entries, {} (max: {}, archive: {})",
-            audit_entries,
-            format_bytes(audit_size),
-            self.audit_retention.max_entries,
-            if self.audit_retention.archive_enabled {
-                "on"
-            } else {
-                "off"
-            }
-        ));
-        if archive_count > 0 {
-            ui.monospace(format!(
-                "audit archives: {} files, {}",
-                archive_count,
-                format_bytes(archive_bytes)
-            ));
-        }
-        ui.monospace(format!(
-            "snapshots: {} (max: {})",
-            format_bytes(snapshot_size),
-            self.snapshot_history_max_entries
-        ));
-    }
-
     fn render_connector_row(&self, ui: &mut egui::Ui, health: &crate::connectors::ConnectorHealth) {
         let mono_sm = FontId::new(12.0, FontFamily::Monospace);
         let (badge_fg, badge_bg) = match &health.status {
-            crate::connectors::ConnectorStatus::Disabled => (
-                egui::Color32::from_rgb(130, 140, 150),
-                egui::Color32::from_rgb(30, 34, 40),
-            ),
             crate::connectors::ConnectorStatus::Connecting => (
                 egui::Color32::from_rgb(130, 205, 235),
                 egui::Color32::from_rgb(24, 38, 50),
@@ -1741,37 +1696,43 @@ impl SentinelDashboard {
         ui.add_space(4.0);
     }
 
-    fn render_navigation_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("Views (Alt+1..5 quick switch)")
-                .weak()
-                .font(FontId::new(12.0, FontFamily::Proportional)),
-        );
-        ui.horizontal_wrapped(|ui| {
-            for view in DashboardView::all() {
-                let selected = self.active_view == view;
-                let tab = ui
-                    .selectable_label(selected, view.label())
-                    .on_hover_text(view.help());
-                tab.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::SelectableLabel,
-                        format!("Open {} view", view.label()),
-                    )
-                });
-                if tab.clicked() {
-                    self.active_view = view;
+    fn section_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        section_id: &'static str,
+        icon_key: &str,
+        icon_svg: &'static [u8],
+        title: &str,
+    ) -> bool {
+        let is_collapsed = self.collapsed_sections.contains(section_id);
+        let indicator = if is_collapsed { "▸" } else { "▾" };
+        let resp = ui.horizontal_wrapped(|ui| {
+            icons::paint(ui, icon_key, icon_svg, 16.0);
+            let btn = ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{indicator} {title}"))
+                        .strong()
+                        .font(FontId::new(15.0, FontFamily::Proportional)),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if btn.clicked() {
+                if is_collapsed {
+                    self.collapsed_sections.remove(section_id);
+                } else {
+                    self.collapsed_sections.insert(section_id);
                 }
             }
-            ui.separator();
-            if ui
-                .small_button("(?)")
-                .on_hover_text("Open contextual help for this view")
-                .clicked()
-            {
-                self.show_view_help = true;
-            }
         });
+
+        if let Some(target) = self.scroll_to_section {
+            if target == section_id {
+                resp.response.scroll_to_me(Some(egui::Align::TOP));
+                self.scroll_to_section = None;
+            }
+        }
+
+        !self.collapsed_sections.contains(section_id)
     }
 
     fn connector_health_for(&self, name: &str) -> Option<crate::connectors::ConnectorHealth> {
@@ -1782,149 +1743,319 @@ impl SentinelDashboard {
         passive.health_for(name).cloned()
     }
 
-    fn render_peerweave_view(&self, ui: &mut egui::Ui) {
-        ui.heading("PeerWeave");
-        let Some(health) = self.connector_health_for("PeerWeave") else {
-            ui.label("PeerWeave connector is disabled.");
-            ui.monospace("Enable with MANTICORE_PEERWEAVE_ENABLED=true");
-            return;
-        };
-        self.render_connector_row(ui, &health);
-
-        let Some(snapshot) = self.connector_summary.snapshot_for("PeerWeave") else {
-            ui.label("Waiting for PeerWeave snapshot data...");
-            return;
-        };
-
-        let payload = snapshot.data.get("data").unwrap_or(&snapshot.data);
-        let node = payload.get("node").cloned().unwrap_or_default();
-        let graph = payload.get("graph").cloned().unwrap_or_default();
-        ui.separator();
-        ui.label(
-            RichText::new(format!(
-                "Node: {}  |  Status: {}  |  Uptime: {}s",
-                node.get("peerId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                node.get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                node.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0)
-            ))
-            .strong(),
-        );
-        ui.label(format!(
-            "Peers: {}  |  Graph nodes: {}  |  Graph edges: {}",
-            node.get("peers")
-                .and_then(|p| p.get("count"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0),
-            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0)
-        ));
-
+    fn render_unified_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, central_fill_w: f32) {
+        self.render_overview_quick_tiles(ui);
         ui.add_space(8.0);
-        ui.label(RichText::new("Spaces").strong());
-        if let Some(spaces) = payload.get("spaces").and_then(|v| v.as_array()) {
-            if spaces.is_empty() {
-                ui.label("No spaces returned.");
+
+        // --- Overview section (CPU + Memory) ---
+        if self.section_header(
+            ui,
+            SECTION_OVERVIEW,
+            "overview-radar",
+            icons::RADAR,
+            "Overview",
+        ) {
+            ui.label(egui::RichText::new("CPU, memory at a glance.").weak());
+            ui.add_space(4.0);
+            if let Some(snapshot) = &self.latest {
+                render_overview_metrics(ui, snapshot);
             } else {
-                for space in spaces.iter().take(16) {
-                    let name = space
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unnamed");
-                    let sync = space
-                        .get("syncState")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let ops = space.get("opsCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    ui.label(format!("{name} · sync={sync} · ops={ops}"));
+                ui.spinner();
+                ui.label("Collecting first snapshot...");
+            }
+        }
+        ui.separator();
+
+        // --- Disk & Network throughput (collapsed by default) ---
+        if self.section_header(
+            ui,
+            SECTION_DISK_NET,
+            "panel-disk",
+            icons::DISK,
+            "Disk & Network Throughput",
+        ) {
+            if let Some(snapshot) = &self.latest {
+                let gap = ui.spacing().item_spacing.x;
+                let avail = ui.available_width();
+                let half = ((avail - gap) * 0.5).max(0.0);
+                if half < 200.0 {
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        throughput_panel_heading(
+                            ui,
+                            "panel-disk-inner",
+                            icons::DISK,
+                            "Disk throughput",
+                            "Per-device read/write rates.",
+                        );
+                        disk_throughput_rows(ui, snapshot);
+                    });
+                    ui.add_space(8.0);
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        throughput_panel_heading(
+                            ui,
+                            "panel-network-inner",
+                            icons::NETWORK,
+                            "Network throughput",
+                            "Per-interface receive/transmit rates.",
+                        );
+                        network_throughput_rows(ui, snapshot);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let col_w = ((ui.available_width() - gap) * 0.5).max(1.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(col_w);
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                throughput_panel_heading(
+                                    ui,
+                                    "panel-disk-inner",
+                                    icons::DISK,
+                                    "Disk throughput",
+                                    "Per-device read/write rates.",
+                                );
+                                disk_throughput_rows(ui, snapshot);
+                            });
+                        });
+                        ui.vertical(|ui| {
+                            ui.set_width(col_w);
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                throughput_panel_heading(
+                                    ui,
+                                    "panel-network-inner",
+                                    icons::NETWORK,
+                                    "Network throughput",
+                                    "Per-interface receive/transmit rates.",
+                                );
+                                network_throughput_rows(ui, snapshot);
+                            });
+                        });
+                    });
+                }
+            } else {
+                ui.spinner();
+                ui.label("Collecting first snapshot...");
+            }
+        }
+        ui.separator();
+
+        // --- Control + Activity (operator shell + top processes) ---
+        if self.section_header(
+            ui,
+            SECTION_CONTROL,
+            "section-command",
+            icons::COMMAND,
+            "Control & Activity",
+        ) {
+            const CONTROL_ACTIVITY_SPLIT_PX: f32 = 1060.0;
+            if central_fill_w >= CONTROL_ACTIVITY_SPLIT_PX {
+                ui.horizontal_top(|ui| {
+                    let gap = ui.spacing().item_spacing.x;
+                    let tw = ui.available_width();
+                    let w_control = tw * 0.44;
+                    let w_activity = (tw - w_control - gap).max(220.0);
+                    ui.vertical(|ui| {
+                        ui.set_min_width(w_control);
+                        ui.set_max_width(w_control);
+                        self.render_control_section(ui, ctx);
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_min_width(w_activity);
+                        ui.set_max_width(w_activity);
+                        if let Some(snapshot) = self.latest.clone() {
+                            self.render_activity_section(ui, &snapshot);
+                        } else {
+                            ui.spinner();
+                            ui.label("Collecting first snapshot...");
+                        }
+                    });
+                });
+            } else {
+                self.render_control_section(ui, ctx);
+                ui.add_space(12.0);
+                if let Some(snapshot) = self.latest.clone() {
+                    self.render_activity_section(ui, &snapshot);
+                } else {
+                    ui.spinner();
+                    ui.label("Collecting first snapshot...");
                 }
             }
-        } else {
-            ui.label("No spaces payload available.");
+        }
+        ui.separator();
+
+        // --- Processes (full sortable/filterable table) ---
+        if self.section_header(
+            ui,
+            SECTION_PROCESSES,
+            "process-view",
+            icons::PROCESS,
+            "Processes",
+        ) {
+            self.render_processes_section(ui);
+        }
+        ui.separator();
+
+        // --- Audit trail ---
+        if self.section_header(
+            ui,
+            SECTION_AUDIT,
+            "audit-section",
+            icons::AUDIT,
+            "Audit Trail",
+        ) {
+            self.render_audit_section(ui);
+        }
+        ui.separator();
+
+        // --- Connectors ---
+        if self.section_header(
+            ui,
+            SECTION_CONNECTORS,
+            "connectors-network",
+            icons::NETWORK,
+            "Ecosystem Connectors",
+        ) {
+            self.render_connectors_section(ui);
         }
     }
 
-    fn render_evrus_view(&self, ui: &mut egui::Ui) {
-        ui.heading("EVRUS");
-        let Some(health) = self.connector_health_for("EVRUS") else {
-            ui.label("EVRUS connector is disabled.");
-            ui.monospace("Enable with MANTICORE_EVRUS_ENABLED=true");
+    fn render_overview_quick_tiles(&mut self, ui: &mut egui::Ui) {
+        let Some(snapshot) = &self.latest else {
             return;
         };
-        self.render_connector_row(ui, &health);
-
-        ui.separator();
-        ui.label(format!("Auth mode: {}", self.auth_mode_label));
-        ui.label(format!("Role: {}", self.role_label));
-        if let Some(lifecycle) = self.token_lifecycle {
-            let now = now_unix_secs();
-            let expiry = lifecycle.issued_at.saturating_add(lifecycle.ttl_secs);
-            let remaining = expiry.saturating_sub(now);
-            ui.label(format!("Token expiry countdown: {}s", remaining));
+        let mem_pct = if snapshot.memory.total == 0 {
+            0.0
         } else {
-            ui.label("Token expiry countdown: n/a");
-        }
+            snapshot.memory.used as f32 / snapshot.memory.total as f32 * 100.0
+        };
+        let total_disk_bw: u64 = snapshot
+            .disks
+            .iter()
+            .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec))
+            .sum();
+        let total_net_bw: u64 = snapshot
+            .network
+            .iter()
+            .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec))
+            .sum();
+        let highest = throughput_severity(total_disk_bw.max(total_net_bw));
+        let (sev_fg, sev_bg) = severity_pill_colors(highest);
 
-        if let Some(jwt) = self.evrus_jwt.as_deref() {
-            if let Some(identity) = parse_identity_from_jwt(jwt) {
-                ui.label(format!(
-                    "Operator DID: {}",
-                    identity.did.unwrap_or_else(|| "unknown".into())
-                ));
-                ui.label(format!(
-                    "Display name: {}",
-                    identity.display_name.unwrap_or_else(|| "unknown".into())
-                ));
-                if let Some(exp) = identity.exp {
-                    let remaining = exp.saturating_sub(now_unix_secs());
-                    ui.label(format!("JWT exp countdown: {}s", remaining));
-                }
-            } else {
-                ui.label("Operator identity: JWT configured, claims unavailable");
+        ui.horizontal_wrapped(|ui| {
+            if render_clickable_tile(ui, "CPU", format!("{:.1}%", snapshot.cpu.usage_percent)) {
+                self.collapsed_sections.remove(SECTION_OVERVIEW);
+                self.scroll_to_section = Some(SECTION_OVERVIEW);
             }
-        } else {
-            ui.label("Operator identity: no EVRUS JWT configured");
-        }
-
-        let anchor_enabled = self
-            .connector_summary
-            .snapshot_for("EVRUS")
-            .and_then(|s| s.data.get("anchor_enabled"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        ui.label(format!(
-            "Vault connection: {}",
-            if matches!(health.status, crate::connectors::ConnectorStatus::Healthy) {
-                "healthy"
-            } else {
-                "degraded"
+            if render_clickable_tile(ui, "MEM", format!("{:.0}%", mem_pct)) {
+                self.collapsed_sections.remove(SECTION_OVERVIEW);
+                self.scroll_to_section = Some(SECTION_OVERVIEW);
             }
-        ));
-        ui.label(format!(
-            "Evrmore chain height: {}",
-            if let Some(height) = self.anchor_state.last_anchor_blockheight {
-                height.to_string()
-            } else if anchor_enabled {
-                "awaiting first anchor".to_string()
-            } else {
-                "anchoring disabled".to_string()
+            if render_clickable_tile(ui, "DISK BW", human_bytes(total_disk_bw)) {
+                self.collapsed_sections.remove(SECTION_DISK_NET);
+                self.scroll_to_section = Some(SECTION_DISK_NET);
             }
-        ));
-        ui.label(format!(
-            "Last audit anchor: {}",
-            self.anchor_state
-                .last_anchor_txid
-                .as_deref()
-                .unwrap_or("none")
-        ));
-        ui.label("Policy summary: local execution policy active; EVRUS policy bridge pending");
+            if render_clickable_tile(ui, "NET BW", human_bytes(total_net_bw)) {
+                self.collapsed_sections.remove(SECTION_DISK_NET);
+                self.scroll_to_section = Some(SECTION_DISK_NET);
+            }
+            if self.snapshot_history_enabled {
+                render_quick_tile(
+                    ui,
+                    "HIST 1H",
+                    format!("{}", self.snapshot_history_recent_hour),
+                );
+            }
+            if render_clickable_tile(ui, "ALERTS", format!("{}", self.latest_alerts.len())) {
+                self.collapsed_sections.remove(SECTION_AUDIT);
+                self.scroll_to_section = Some(SECTION_AUDIT);
+            }
+            ui.label(
+                RichText::new(format!(" {} ", highest.label()))
+                    .color(sev_fg)
+                    .background_color(sev_bg)
+                    .font(FontId::new(12.0, FontFamily::Monospace))
+                    .strong(),
+            )
+            .on_hover_text("Highest throughput severity across disk/network.");
+            if let Some(alert) = self.latest_alerts.first() {
+                let tag = match alert.severity {
+                    AlertSeverity::Info => "INFO",
+                    AlertSeverity::Warning => "WARN",
+                    AlertSeverity::Critical => "CRIT",
+                };
+                let color = match alert.severity {
+                    AlertSeverity::Info => egui::Color32::from_rgb(86, 145, 181),
+                    AlertSeverity::Warning => egui::Color32::from_rgb(196, 158, 66),
+                    AlertSeverity::Critical => egui::Color32::from_rgb(180, 66, 66),
+                };
+                ui.colored_label(
+                    color,
+                    format!(
+                        "{}: {} ({} {:.2} / {:.2})",
+                        tag, alert.rule_id, alert.message, alert.value, alert.threshold
+                    ),
+                );
+            }
+        });
     }
 
-    fn render_audit_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Audit");
+    fn render_processes_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Sort");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::CpuDesc, "CPU")
+                .on_hover_text("Highest CPU first.");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::RssDesc, "RSS")
+                .on_hover_text("Largest memory footprint first.");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::PidAsc, "PID")
+                .on_hover_text("PID ascending.");
+            ui.selectable_value(&mut self.process_sort, ProcessSort::ThreadsDesc, "Threads")
+                .on_hover_text("Most threads first.");
+            ui.separator();
+            ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.process_filter)
+                    .desired_width(180.0)
+                    .hint_text("name or PID..."),
+            );
+        });
+        ui.separator();
+        let Some(snapshot) = &self.latest else {
+            ui.spinner();
+            ui.label("Collecting first snapshot...");
+            return;
+        };
+        let mut rows: Vec<ProcessMetrics> = snapshot.processes.clone();
+        if !self.process_filter.is_empty() {
+            let q = self.process_filter.to_ascii_lowercase();
+            rows.retain(|p| {
+                p.name.to_ascii_lowercase().contains(&q)
+                    || p.pid.to_string().contains(&q)
+                    || p.cmdline.to_ascii_lowercase().contains(&q)
+            });
+        }
+        match self.process_sort {
+            ProcessSort::CpuDesc => rows.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
+            ProcessSort::RssDesc => rows.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
+            ProcessSort::PidAsc => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
+            ProcessSort::ThreadsDesc => rows.sort_by(|a, b| b.threads.cmp(&a.threads)),
+        }
+        ui.label(
+            RichText::new(format!("{} processes shown", rows.len()))
+                .weak()
+                .font(FontId::new(11.5, FontFamily::Proportional)),
+        );
+        let expanded = self.expanded_process_pid;
+        let mut new_expanded = expanded;
+        process_metrics_table_full(ui, &rows, expanded, &mut new_expanded);
+        self.expanded_process_pid = new_expanded;
+    }
+
+    fn render_audit_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let lbl = ui.label("Filter");
             ui.add(
@@ -1987,7 +2118,7 @@ impl SentinelDashboard {
         ui.separator();
 
         let fetch_size = (self.audit_page + 1) * self.audit_page_size + self.audit_page_size;
-        if self.last_audit_refresh.elapsed() >= Duration::from_secs(1) {
+        if self.last_audit_refresh.elapsed() >= Duration::from_secs(2) {
             self.audit_feed = read_recent(&self.helper.audit_path, fetch_size).unwrap_or_default();
             self.last_audit_refresh = Instant::now();
         }
@@ -2049,8 +2180,8 @@ impl SentinelDashboard {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
-            .id_source("audit_events_scroll")
-            .max_height(ui.available_height().max(200.0))
+            .id_source("audit_events_scroll_unified")
+            .max_height(400.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (view_idx, event) in filtered[start..end].iter().enumerate() {
@@ -2111,9 +2242,7 @@ impl SentinelDashboard {
                                     event.anchor_merkle_root.as_deref().unwrap_or("-")
                                 ));
                                 if ui.small_button("Copy JSON").clicked() {
-                                    if let Ok(json) =
-                                        serde_json::to_string_pretty(event)
-                                    {
+                                    if let Ok(json) = serde_json::to_string_pretty(event) {
                                         ui.output_mut(|o| o.copied_text = json);
                                     }
                                 }
@@ -2123,204 +2252,226 @@ impl SentinelDashboard {
             });
     }
 
-    fn render_processes_view(&mut self, ui: &mut egui::Ui) {
+    fn render_connectors_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "process-view", icons::PROCESS, 18.0);
-            ui.heading("Processes");
+            ui.label(egui::RichText::new("PeerWeave and EVRUS integration status.").weak());
+            if ui
+                .small_button("Setup Wizard")
+                .on_hover_text("Open guided connector setup")
+                .clicked()
+            {
+                self.show_connector_wizard = true;
+                self.wizard_step = 0;
+            }
         });
-        ui.label(
-            egui::RichText::new("Sortable process inspection by CPU, RSS, PID, and thread count.")
-                .weak(),
-        );
         ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Sort");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::CpuDesc, "CPU")
-                .on_hover_text("Highest CPU first.");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::RssDesc, "RSS")
-                .on_hover_text("Largest memory footprint first.");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::PidAsc, "PID")
-                .on_hover_text("PID ascending.");
-            ui.selectable_value(&mut self.process_sort, ProcessSort::ThreadsDesc, "Threads")
-                .on_hover_text("Most threads first.");
-            ui.separator();
-            ui.label("Filter");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.process_filter)
-                    .desired_width(180.0)
-                    .hint_text("name or PID..."),
-            );
-        });
-        ui.separator();
-        let Some(snapshot) = &self.latest else {
-            ui.spinner();
-            ui.label("Collecting first snapshot...");
-            return;
-        };
-        let mut rows: Vec<ProcessMetrics> = snapshot.processes.clone();
-        if !self.process_filter.is_empty() {
-            let q = self.process_filter.to_ascii_lowercase();
-            rows.retain(|p| {
-                p.name.to_ascii_lowercase().contains(&q)
-                    || p.pid.to_string().contains(&q)
-                    || p.cmdline.to_ascii_lowercase().contains(&q)
-            });
-        }
-        match self.process_sort {
-            ProcessSort::CpuDesc => rows.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
-            ProcessSort::RssDesc => rows.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
-            ProcessSort::PidAsc => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
-            ProcessSort::ThreadsDesc => rows.sort_by(|a, b| b.threads.cmp(&a.threads)),
-        }
-        ui.label(
-            RichText::new(format!("{} processes shown", rows.len()))
-                .weak()
-                .font(FontId::new(11.5, FontFamily::Proportional)),
-        );
-        let expanded = self.expanded_process_pid;
-        let mut new_expanded = expanded;
-        process_metrics_table_full(ui, &rows, expanded, &mut new_expanded);
-        self.expanded_process_pid = new_expanded;
-    }
 
-    fn render_network_view(&self, ui: &mut egui::Ui) {
-        ui.heading("Network & Throughput");
-        let Some(snapshot) = &self.latest else {
-            ui.spinner();
-            ui.label("Collecting first snapshot...");
-            return;
-        };
-        ui.group(|ui| {
-            ui.label(RichText::new("Interfaces").strong());
-            network_throughput_rows(ui, snapshot);
-        });
-        ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.label(RichText::new("Disk throughput").strong());
-            disk_throughput_rows(ui, snapshot);
-        });
-    }
-
-    fn render_system_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, central_fill_w: f32) {
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "overview-radar", icons::RADAR, 18.0);
-            ui.heading("Overview");
-        });
-        ui.label(egui::RichText::new("CPU, memory, disk, and network at a glance.").weak());
-        ui.add_space(8.0);
-        self.render_overview_quick_tiles(ui);
-        ui.add_space(8.0);
-        if let Some(snapshot) = &self.latest {
-            render_overview_metrics(ui, snapshot);
+        if self.connector_summary.entries.is_empty() {
+            let passive = self.engine.connector_summary_passive();
+            if passive.entries.is_empty() {
+                ui.label("No connectors configured.");
+                ui.monospace(
+                    "Set MANTICORE_PEERWEAVE_ENABLED=true or MANTICORE_EVRUS_ENABLED=true to enable integrations.",
+                );
+            } else {
+                for entry in &passive.entries {
+                    self.render_connector_row(ui, entry);
+                }
+            }
         } else {
-            ui.spinner();
-            ui.label("Collecting first snapshot...");
+            for entry in &self.connector_summary.entries {
+                self.render_connector_row(ui, entry);
+            }
         }
 
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(12.0);
-
-        const CONTROL_ACTIVITY_SPLIT_PX: f32 = 1060.0;
-        if central_fill_w >= CONTROL_ACTIVITY_SPLIT_PX {
-            ui.horizontal_top(|ui| {
-                let gap = ui.spacing().item_spacing.x;
-                let tw = ui.available_width();
-                let w_control = tw * 0.44;
-                let w_activity = (tw - w_control - gap).max(220.0);
-                ui.vertical(|ui| {
-                    ui.set_min_width(w_control);
-                    ui.set_max_width(w_control);
-                    self.render_control_section(ui, ctx);
-                });
-                ui.vertical(|ui| {
-                    ui.set_min_width(w_activity);
-                    ui.set_max_width(w_activity);
-                    if let Some(snapshot) = self.latest.clone() {
-                        self.render_activity_section(ui, &snapshot);
+        // PeerWeave detail (nested collapsible)
+        if self.connector_health_for("PeerWeave").is_some() {
+            egui::CollapsingHeader::new(RichText::new("PeerWeave detail").strong())
+                .id_source("peerweave-detail")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Some(snapshot) = self.connector_summary.snapshot_for("PeerWeave") {
+                        let payload = snapshot.data.get("data").unwrap_or(&snapshot.data);
+                        let node = payload.get("node").cloned().unwrap_or_default();
+                        let graph = payload.get("graph").cloned().unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!(
+                                "Node: {}  |  Status: {}  |  Uptime: {}s",
+                                node.get("peerId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown"),
+                                node.get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown"),
+                                node.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0)
+                            ))
+                            .strong(),
+                        );
+                        ui.label(format!(
+                            "Peers: {}  |  Graph nodes: {}  |  Graph edges: {}",
+                            node.get("peers")
+                                .and_then(|p| p.get("count"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0)
+                        ));
+                        if let Some(spaces) = payload.get("spaces").and_then(|v| v.as_array()) {
+                            ui.label(RichText::new("Spaces").strong());
+                            if spaces.is_empty() {
+                                ui.label("No spaces returned.");
+                            } else {
+                                for space in spaces.iter().take(16) {
+                                    let name = space
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unnamed");
+                                    let sync = space
+                                        .get("syncState")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    let ops =
+                                        space.get("opsCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    ui.label(format!("{name} · sync={sync} · ops={ops}"));
+                                }
+                            }
+                        }
                     } else {
-                        ui.spinner();
-                        ui.label("Collecting first snapshot...");
+                        ui.label("Waiting for PeerWeave snapshot data...");
                     }
                 });
-            });
-        } else {
-            self.render_control_section(ui, ctx);
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(12.0);
-            if let Some(snapshot) = self.latest.clone() {
-                self.render_activity_section(ui, &snapshot);
-            } else {
-                ui.spinner();
-                ui.label("Collecting first snapshot...");
-            }
         }
-    }
 
-    fn render_overview_quick_tiles(&self, ui: &mut egui::Ui) {
-        let Some(snapshot) = &self.latest else {
-            return;
-        };
-        let mem_pct = if snapshot.memory.total == 0 {
-            0.0
-        } else {
-            snapshot.memory.used as f32 / snapshot.memory.total as f32 * 100.0
-        };
-        let total_disk_bw: u64 = snapshot
-            .disks
-            .iter()
-            .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec))
-            .sum();
-        let total_net_bw: u64 = snapshot
-            .network
-            .iter()
-            .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec))
-            .sum();
-        let highest = throughput_severity(total_disk_bw.max(total_net_bw));
-        let (sev_fg, sev_bg) = severity_pill_colors(highest);
+        // EVRUS detail (nested collapsible)
+        if self.connector_health_for("EVRUS").is_some() {
+            egui::CollapsingHeader::new(RichText::new("EVRUS detail").strong())
+                .id_source("evrus-detail")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(format!("Auth mode: {}", self.auth_mode_label));
+                    ui.label(format!("Role: {}", self.role_label));
+                    if let Some(lifecycle) = self.token_lifecycle {
+                        let now = now_unix_secs();
+                        let expiry = lifecycle.issued_at.saturating_add(lifecycle.ttl_secs);
+                        let remaining = expiry.saturating_sub(now);
+                        ui.label(format!("Token expiry countdown: {}s", remaining));
+                    } else {
+                        ui.label("Token expiry countdown: n/a");
+                    }
+                    if let Some(jwt) = self.evrus_jwt.as_deref() {
+                        if let Some(identity) = parse_identity_from_jwt(jwt) {
+                            ui.label(format!(
+                                "Operator DID: {}",
+                                identity.did.unwrap_or_else(|| "unknown".into())
+                            ));
+                            ui.label(format!(
+                                "Display name: {}",
+                                identity.display_name.unwrap_or_else(|| "unknown".into())
+                            ));
+                            if let Some(exp) = identity.exp {
+                                let remaining = exp.saturating_sub(now_unix_secs());
+                                ui.label(format!("JWT exp countdown: {}s", remaining));
+                            }
+                        } else {
+                            ui.label("Operator identity: JWT configured, claims unavailable");
+                        }
+                    } else {
+                        ui.label("Operator identity: no EVRUS JWT configured");
+                    }
 
-        ui.horizontal_wrapped(|ui| {
-            render_quick_tile(ui, "CPU", format!("{:.1}%", snapshot.cpu.usage_percent));
-            render_quick_tile(ui, "MEM", format!("{:.0}%", mem_pct));
-            render_quick_tile(ui, "DISK BW", human_bytes(total_disk_bw));
-            render_quick_tile(ui, "NET BW", human_bytes(total_net_bw));
-            if self.snapshot_history_enabled {
-                render_quick_tile(
-                    ui,
-                    "HIST 1H",
-                    format!("{}", self.snapshot_history_recent_hour),
-                );
+                    let anchor_enabled = self
+                        .connector_summary
+                        .snapshot_for("EVRUS")
+                        .and_then(|s| s.data.get("anchor_enabled"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let health = self.connector_health_for("EVRUS");
+                    ui.label(format!(
+                        "Vault connection: {}",
+                        if health.as_ref().map_or(false, |h| matches!(
+                            h.status,
+                            crate::connectors::ConnectorStatus::Healthy
+                        )) {
+                            "healthy"
+                        } else {
+                            "degraded"
+                        }
+                    ));
+                    ui.label(format!(
+                        "Evrmore chain height: {}",
+                        if let Some(height) = self.anchor_state.last_anchor_blockheight {
+                            height.to_string()
+                        } else if anchor_enabled {
+                            "awaiting first anchor".to_string()
+                        } else {
+                            "anchoring disabled".to_string()
+                        }
+                    ));
+                    ui.label(format!(
+                        "Last audit anchor: {}",
+                        self.anchor_state
+                            .last_anchor_txid
+                            .as_deref()
+                            .unwrap_or("none")
+                    ));
+                });
+        }
+
+        ui.separator();
+        ui.label(RichText::new("Self-health telemetry").strong());
+        ui.monospace(format!(
+            "collect_last_ms={:.3} collect_avg_ms={:.3} cycles={} connector_polls={}",
+            self.self_collect_last_ms,
+            self.self_collect_avg_ms,
+            self.self_collect_cycles,
+            self.self_connector_polls
+        ));
+        ui.monospace(format!(
+            "alerts_active={} errors_total={} last_error_ts={}",
+            self.latest_alerts.len(),
+            self.self_errors_total,
+            self.self_last_error_ts
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+
+        ui.separator();
+        ui.label(RichText::new("Storage health").strong());
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let audit_path = default_audit_path(&cwd);
+        let snapshot_path = &self.snapshot_history_path;
+
+        let audit_size = std::fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
+        let audit_entries = audit_entry_count(&audit_path);
+        let snapshot_size = std::fs::metadata(snapshot_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let (archive_count, archive_bytes) = audit_archive_stats(&audit_path);
+
+        ui.monospace(format!(
+            "audit: {} entries, {} (max: {}, archive: {})",
+            audit_entries,
+            format_bytes(audit_size),
+            self.audit_retention.max_entries,
+            if self.audit_retention.archive_enabled {
+                "on"
+            } else {
+                "off"
             }
-            render_quick_tile(ui, "ALERTS", format!("{}", self.latest_alerts.len()));
-            ui.label(
-                RichText::new(format!(" {} ", highest.label()))
-                    .color(sev_fg)
-                    .background_color(sev_bg)
-                    .font(FontId::new(12.0, FontFamily::Monospace))
-                    .strong(),
-            )
-            .on_hover_text("Highest throughput severity across disk/network.");
-            if let Some(alert) = self.latest_alerts.first() {
-                let tag = match alert.severity {
-                    AlertSeverity::Info => "INFO",
-                    AlertSeverity::Warning => "WARN",
-                    AlertSeverity::Critical => "CRIT",
-                };
-                let color = match alert.severity {
-                    AlertSeverity::Info => egui::Color32::from_rgb(86, 145, 181),
-                    AlertSeverity::Warning => egui::Color32::from_rgb(196, 158, 66),
-                    AlertSeverity::Critical => egui::Color32::from_rgb(180, 66, 66),
-                };
-                ui.colored_label(
-                    color,
-                    format!(
-                        "{}: {} ({} {:.2} / {:.2})",
-                        tag, alert.rule_id, alert.message, alert.value, alert.threshold
-                    ),
-                );
-            }
-        });
+        ));
+        if archive_count > 0 {
+            ui.monospace(format!(
+                "audit archives: {} files, {}",
+                archive_count,
+                format_bytes(archive_bytes)
+            ));
+        }
+        ui.monospace(format!(
+            "snapshots: {} (max: {})",
+            format_bytes(snapshot_size),
+            self.snapshot_history_max_entries
+        ));
     }
 
     fn fill_vertical_remainder(&self, ui: &mut egui::Ui) {
@@ -2340,7 +2491,7 @@ impl eframe::App for SentinelDashboard {
         }
         self.poll();
         self.handle_global_shortcuts(ctx);
-        ctx.request_repaint_after(Duration::from_millis(120));
+        ctx.request_repaint_after(self.ui_repaint_interval);
 
         let screen = ctx.screen_rect();
         let top_scroll_cap = (screen.height() * 0.42).clamp(72.0, 320.0);
@@ -2497,11 +2648,11 @@ impl eframe::App for SentinelDashboard {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             ui.heading("Quick Start");
-                            ui.monospace("1) Scroll the main area for metrics, command palette, processes, and audit.");
-                            ui.monospace("2) Top bar shows live CPU/Mem/load chips plus Trust/Role/Auth.");
-                            ui.monospace("3) Metrics: CPU (aggregate + per-core bars), memory, disk/network.");
+                            ui.monospace("1) One unified scrollable view with collapsible sections.");
+                            ui.monospace("2) Click quick tiles (CPU/MEM/DISK/NET/ALERTS) to jump to detail.");
+                            ui.monospace("3) Click section headers to expand/collapse.");
                             ui.monospace("4) Operator shell (Ctrl/⌘+K): Tab, history, Enter — no raw shell.");
-                            ui.monospace("5) Top processes and Recent Audit Events below.");
+                            ui.monospace("5) Processes, Audit, and Connectors are below the main overview.");
                             ui.separator();
                             ui.heading("Command Examples");
                             ui.monospace("show cpu");
@@ -2532,38 +2683,6 @@ impl eframe::App for SentinelDashboard {
                             });
                             if close.clicked() {
                                 self.show_help_center = false;
-                            }
-                        });
-                });
-        }
-
-        if self.show_view_help {
-            egui::Window::new(format!("{} — Help", self.active_view.label()))
-                .collapsible(true)
-                .resizable(true)
-                .default_size(egui::vec2(520.0, 400.0))
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_source("view_help_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let topic = match self.active_view {
-                                DashboardView::System => "commands",
-                                DashboardView::Processes => "commands",
-                                DashboardView::Network => "commands",
-                                DashboardView::PeerWeave => "peerweave",
-                                DashboardView::Evrus => "evrus",
-                                DashboardView::Audit => "audit",
-                                DashboardView::Connectors => "connectors",
-                            };
-                            let text = crate::core::command::help_text(Some(topic));
-                            ui.monospace(&text);
-                            ui.separator();
-                            ui.label(RichText::new("Related configuration:").strong());
-                            let config_text = crate::core::command::help_text(Some("config"));
-                            ui.monospace(&config_text);
-                            if ui.button("Close").clicked() {
-                                self.show_view_help = false;
                             }
                         });
                 });
@@ -2636,19 +2755,7 @@ impl eframe::App for SentinelDashboard {
                         ui.separator();
                     }
 
-                    self.render_navigation_tabs(ui);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    match self.active_view {
-                        DashboardView::System => self.render_system_view(ui, ctx, central_fill_w),
-                        DashboardView::Processes => self.render_processes_view(ui),
-                        DashboardView::Network => self.render_network_view(ui),
-                        DashboardView::PeerWeave => self.render_peerweave_view(ui),
-                        DashboardView::Evrus => self.render_evrus_view(ui),
-                        DashboardView::Audit => self.render_audit_view(ui),
-                        DashboardView::Connectors => self.render_connectors_panel(ui),
-                    }
-
+                    self.render_unified_view(ui, ctx, central_fill_w);
                     self.fill_vertical_remainder(ui);
                 });
         });
@@ -2701,7 +2808,10 @@ fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         .show(ui, |ui| {
             ui.monospace(format!("device: {}", disk.device));
             ui.monospace(format!("read:  {}/s", human_bytes(disk.read_bytes_per_sec)));
-            ui.monospace(format!("write: {}/s", human_bytes(disk.write_bytes_per_sec)));
+            ui.monospace(format!(
+                "write: {}/s",
+                human_bytes(disk.write_bytes_per_sec)
+            ));
             ui.monospace(format!("total: {}/s", human_bytes(total)));
         });
     }
@@ -2806,7 +2916,7 @@ fn process_metrics_table_full(
 
     egui::ScrollArea::vertical()
         .id_source("process_table_scroll")
-        .max_height(ui.available_height().max(300.0))
+        .max_height(ui.available_height().max(500.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for process in processes {
@@ -2822,15 +2932,12 @@ fn process_metrics_table_full(
                             let indicator = if is_expanded { "▾ " } else { "▸ " };
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "{}{}",
-                                        indicator, process.name
-                                    ))
-                                    .color(if is_expanded {
-                                        egui::Color32::from_rgb(130, 205, 235)
-                                    } else {
-                                        ui.visuals().text_color()
-                                    }),
+                                    egui::RichText::new(format!("{}{}", indicator, process.name))
+                                        .color(if is_expanded {
+                                            egui::Color32::from_rgb(130, 205, 235)
+                                        } else {
+                                            ui.visuals().text_color()
+                                        }),
                                 )
                                 .wrap(true)
                                 .sense(egui::Sense::click()),
@@ -2844,19 +2951,12 @@ fn process_metrics_table_full(
                             [RSS_W, 20.0],
                             egui::Label::new(human_bytes(process.memory_bytes)).wrap(false),
                         );
-                        ui.add_sized(
-                            [THR_W, 20.0],
-                            egui::Label::new(process.threads.to_string()),
-                        );
+                        ui.add_sized([THR_W, 20.0], egui::Label::new(process.threads.to_string()));
                     })
                     .response;
 
                 if row_resp.interact(egui::Sense::click()).clicked() {
-                    *new_expanded = if is_expanded {
-                        None
-                    } else {
-                        Some(process.pid)
-                    };
+                    *new_expanded = if is_expanded { None } else { Some(process.pid) };
                 }
 
                 if is_expanded {
@@ -2882,7 +2982,12 @@ fn process_metrics_table_full(
 
 fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
     let mut ignored = None;
-    process_metrics_table_full(ui, &processes.iter().take(20).cloned().collect::<Vec<_>>(), None, &mut ignored);
+    process_metrics_table_full(
+        ui,
+        &processes.iter().take(40).cloned().collect::<Vec<_>>(),
+        None,
+        &mut ignored,
+    );
 }
 
 fn cpu_util_fill(pct: f32) -> egui::Color32 {
@@ -3046,9 +3151,7 @@ fn throughput_panel_heading(
 }
 
 fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
-    // Minimum half-width before stacking pairs vertically (avoids horizontal clip).
     const MIN_CPU_MEM_COL: f32 = 168.0;
-    const MIN_DISK_NET_COL: f32 = 200.0;
 
     let gap = ui.spacing().item_spacing.x;
     let avail_row = ui.available_width();
@@ -3181,71 +3284,6 @@ fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
                         info
                     });
                     memory_overview_extras(ui, &snapshot.memory);
-                });
-            });
-        });
-    }
-    ui.add_space(8.0);
-
-    let avail_disk = ui.available_width();
-    let half_disk_net = ((avail_disk - gap) * 0.5).max(0.0);
-    let stack_disk_net = half_disk_net < MIN_DISK_NET_COL;
-
-    if stack_disk_net {
-        ui.vertical(|ui| {
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                throughput_panel_heading(
-                    ui,
-                    "panel-disk",
-                    icons::DISK,
-                    "Disk throughput",
-                    "Per-device read/write rates with severity bands.",
-                );
-                disk_throughput_rows(ui, snapshot);
-            });
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                throughput_panel_heading(
-                    ui,
-                    "panel-network",
-                    icons::NETWORK,
-                    "Network throughput",
-                    "Per-interface receive/transmit rates and severity.",
-                );
-                network_throughput_rows(ui, snapshot);
-            });
-        });
-    } else {
-        ui.horizontal(|ui| {
-            let col_w = ((ui.available_width() - gap) * 0.5).max(1.0);
-            ui.vertical(|ui| {
-                ui.set_width(col_w);
-                ui.group(|ui| {
-                    ui.set_min_width(ui.available_width());
-                    throughput_panel_heading(
-                        ui,
-                        "panel-disk",
-                        icons::DISK,
-                        "Disk throughput",
-                        "Per-device read/write rates with severity bands.",
-                    );
-                    disk_throughput_rows(ui, snapshot);
-                });
-            });
-            ui.vertical(|ui| {
-                ui.set_width(col_w);
-                ui.group(|ui| {
-                    ui.set_min_width(ui.available_width());
-                    throughput_panel_heading(
-                        ui,
-                        "panel-network",
-                        icons::NETWORK,
-                        "Network throughput",
-                        "Per-interface receive/transmit rates and severity.",
-                    );
-                    network_throughput_rows(ui, snapshot);
                 });
             });
         });
@@ -3561,6 +3599,32 @@ fn render_quick_tile(ui: &mut egui::Ui, label: &str, value: String) {
                 );
             });
         });
+}
+
+fn render_clickable_tile(ui: &mut egui::Ui, label: &str, value: String) -> bool {
+    let resp = egui::Frame::none()
+        .fill(egui::Color32::from_rgb(20, 28, 36))
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(Stroke::new(1.0, egui::Color32::from_rgb(42, 58, 74)))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(label)
+                        .font(FontId::new(11.5, FontFamily::Monospace))
+                        .weak(),
+                );
+                ui.label(
+                    RichText::new(value)
+                        .font(FontId::new(15.0, FontFamily::Proportional))
+                        .strong(),
+                );
+            });
+        });
+    resp.response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 const GLOSSARY_ENTRIES: &[(&str, &str)] = &[

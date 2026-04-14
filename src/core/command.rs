@@ -81,7 +81,9 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             let last = n
                 .parse::<usize>()
                 .map_err(|_| "invalid --last value".to_string())?;
-            Ok(CommandAction::ShowAudit { last: last.min(200) })
+            Ok(CommandAction::ShowAudit {
+                last: last.min(200),
+            })
         }
         ["show", "storage"] => Ok(CommandAction::ShowStorage),
         ["help"] => Ok(CommandAction::Help { topic: None }),
@@ -108,9 +110,7 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             }
             Ok(CommandAction::ReniceProcess { pid, nice })
         }
-        _ => Err(
-            "unknown command. Type 'help' for available commands.".to_string(),
-        ),
+        _ => Err("unknown command. Type 'help' for available commands.".to_string()),
     }
 }
 
@@ -249,8 +249,12 @@ Auth:
 Retention:
   MANTICORE_AUDIT_MAX_ENTRIES      500-500000 (default: 10000)
   MANTICORE_AUDIT_ARCHIVE_ENABLED  true|false (default: true)
-  MANTICORE_SNAPSHOT_HISTORY_ENABLED  true|false (default: true)
-  MANTICORE_SNAPSHOT_HISTORY_MAX_ENTRIES 100-200000 (default: 5000)
+  MANTICORE_SNAPSHOT_HISTORY_ENABLED  true|false (default: false)
+  MANTICORE_SNAPSHOT_HISTORY_MAX_ENTRIES 100-200000 (default: 1000)
+  MANTICORE_SNAPSHOT_HISTORY_MAX_AGE_SECS seconds; 0/empty disables
+  MANTICORE_SNAPSHOT_HISTORY_MAX_BYTES bytes; 0/empty disables
+  MANTICORE_SNAPSHOT_HISTORY_SLIM_RECORDS true|false (default: false)
+  MANTICORE_SNAPSHOT_HISTORY_RESET_ON_START true|false (default: false)
 
 SSE:
   MANTICORE_EVENT_STREAM_ENABLED   true|false (default: false)

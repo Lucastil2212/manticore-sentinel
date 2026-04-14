@@ -1,7 +1,6 @@
 use super::{Connector, ConnectorHealth, ConnectorSnapshot, ConnectorStatus};
 use crate::core::config::PeerWeaveConfig;
 use crate::core::snapshot::SystemSnapshot;
-use crate::utils::time::now_unix_secs;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -201,7 +200,6 @@ impl Connector for PeerWeaveConnector {
                 }
                 self.last_snapshot = Some(ConnectorSnapshot {
                     name: "PeerWeave".into(),
-                    timestamp: now_unix_secs(),
                     data,
                 });
                 ConnectorHealth {

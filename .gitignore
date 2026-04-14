@@ -3,6 +3,10 @@
 .dolt/
 *.db
 .beads-credential-key
+.beads/state/
+.beads/audit/events.jsonl
+.beads/audit/merkle_state.json
+.beads/audit/signing.ed25519
 
 
 # Added by cargo

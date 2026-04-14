@@ -11,13 +11,17 @@ use crate::models::process::ProcessMetrics;
 pub struct ProcessCollector {
     previous_proc_ticks: HashMap<u32, u64>,
     previous_total_ticks: Option<u64>,
+    max_entries: usize,
+    cmdline_entries: usize,
 }
 
 impl ProcessCollector {
-    pub fn new() -> Self {
+    pub fn new(max_entries: usize, cmdline_entries: usize) -> Self {
         Self {
             previous_proc_ticks: HashMap::new(),
             previous_total_ticks: None,
+            max_entries,
+            cmdline_entries,
         }
     }
 
@@ -50,6 +54,18 @@ impl ProcessCollector {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        if out.len() > self.max_entries {
+            out.truncate(self.max_entries);
+        }
+        for metrics in out.iter_mut().take(self.cmdline_entries) {
+            metrics.cmdline = Process::new(metrics.pid as i32)
+                .ok()
+                .and_then(|p| p.cmdline().ok())
+                .map(|argv| argv.join(" "))
+                .map(sanitize_text)
+                .unwrap_or_default();
+        }
+
         self.previous_proc_ticks = next_proc_ticks;
         self.previous_total_ticks = Some(total_ticks_now);
         Ok(out)
@@ -78,23 +94,25 @@ impl ProcessCollector {
 
         let status = process.status()?;
         let memory_bytes = status.vmrss.unwrap_or(0).saturating_mul(1024);
-        let cmdline = process
-            .cmdline()
-            .map(|argv| argv.join(" "))
-            .unwrap_or_default();
-
         Ok((
             ProcessMetrics {
                 pid,
-                name: stat.comm,
+                name: sanitize_text(stat.comm),
                 cpu_percent,
                 memory_bytes,
                 threads: status.threads as u32,
-                cmdline,
+                cmdline: String::new(),
             },
             total_proc_ticks,
         ))
     }
+}
+
+fn sanitize_text(input: String) -> String {
+    input
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+        .collect()
 }
 
 fn cpu_total_ticks(cpu: &CpuTime) -> u64 {

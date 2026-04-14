@@ -1,6 +1,5 @@
 use super::{Connector, ConnectorHealth, ConnectorSnapshot, ConnectorStatus};
 use crate::core::config::EvrusConfig;
-use crate::utils::time::now_unix_secs;
 
 /// EVRUS ecosystem connector.
 ///
@@ -88,7 +87,6 @@ impl Connector for EvrusConnector {
         }
         Some(ConnectorSnapshot {
             name: "EVRUS".into(),
-            timestamp: now_unix_secs(),
             data: serde_json::json!({
                 "oidc_healthy": true,
                 "oidc_url": self.config.oidc_url,
