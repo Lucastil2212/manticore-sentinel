@@ -356,7 +356,7 @@ impl SentinelDashboard {
             wizard_url: String::new(),
             wizard_token: String::new(),
             wizard_space_id: String::new(),
-            detailed_mode: false,
+            detailed_mode: true,
             show_glossary: false,
             self_collect_last_ms: 0.0,
             self_collect_avg_ms: 0.0,
@@ -1619,10 +1619,23 @@ impl SentinelDashboard {
                 egui::Label::new(
                     RichText::new(format!("{indicator} {title}"))
                         .strong()
+                        .color(if ui.ui_contains_pointer() {
+                            ui.style().visuals.widgets.hovered.fg_stroke.color
+                        } else {
+                            ui.visuals().text_color()
+                        })
                         .font(FontId::new(14.0, FontFamily::Proportional)),
                 )
                 .sense(egui::Sense::click()),
-            );
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if btn.hovered() {
+                ui.painter().rect_stroke(
+                    btn.rect.expand2(egui::vec2(4.0, 2.0)),
+                    4.0,
+                    Stroke::new(1.0, egui::Color32::from_rgb(96, 176, 210)),
+                );
+            }
             if btn.clicked() {
                 if is_collapsed {
                     self.collapsed_sections.remove(section_id);
@@ -1662,10 +1675,17 @@ impl SentinelDashboard {
             icons::RADAR,
             "Overview",
         ) {
-            ui.label(egui::RichText::new("CPU, memory at a glance.").weak());
+            let mode_label = if self.detailed_mode {
+                "Detailed"
+            } else {
+                "Compact"
+            };
+            ui.label(
+                egui::RichText::new(format!("CPU, memory at a glance ({mode_label} mode).")).weak(),
+            );
             ui.add_space(4.0);
             if let Some(snapshot) = &self.latest {
-                render_overview_metrics(ui, snapshot);
+                render_overview_metrics(ui, snapshot, self.detailed_mode);
             } else {
                 ui.spinner();
                 ui.label("Collecting first snapshot...");
@@ -1853,10 +1873,12 @@ impl SentinelDashboard {
 
         ui.horizontal_wrapped(|ui| {
             if render_clickable_tile(ui, "CPU", format!("{:.1}%", snapshot.cpu.usage_percent)) {
+                self.detailed_mode = true;
                 self.collapsed_sections.remove(SECTION_OVERVIEW);
                 self.scroll_to_section = Some(SECTION_OVERVIEW);
             }
             if render_clickable_tile(ui, "MEM", format!("{:.0}%", mem_pct)) {
+                self.detailed_mode = true;
                 self.collapsed_sections.remove(SECTION_OVERVIEW);
                 self.scroll_to_section = Some(SECTION_OVERVIEW);
             }
@@ -1957,7 +1979,13 @@ impl SentinelDashboard {
         );
         let expanded = self.expanded_process_pid;
         let mut new_expanded = expanded;
-        process_metrics_table_full(ui, &rows, expanded, &mut new_expanded);
+        process_metrics_table_full(
+            ui,
+            &rows,
+            expanded,
+            &mut new_expanded,
+            "main_process_table_scroll",
+        );
         self.expanded_process_pid = new_expanded;
     }
 
@@ -2110,7 +2138,8 @@ impl SentinelDashboard {
                                 }),
                         )
                         .sense(egui::Sense::click()),
-                    );
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
                         self.expanded_audit_idx = if is_expanded { None } else { Some(abs_idx) };
                     }
@@ -2442,14 +2471,6 @@ impl eframe::App for SentinelDashboard {
                     self.show_help_center = true;
                 }
                 ui.separator();
-                let mode_label = if self.detailed_mode { "Detailed" } else { "Compact" };
-                if ui
-                    .small_button(mode_label)
-                    .on_hover_text("Toggle compact/detailed view")
-                    .clicked()
-                {
-                    self.detailed_mode = !self.detailed_mode;
-                }
                 if ui
                     .small_button("Glossary")
                     .on_hover_text("Technical terms glossary")
@@ -2759,6 +2780,7 @@ fn process_metrics_table_full(
     processes: &[ProcessMetrics],
     expanded_pid: Option<u32>,
     new_expanded: &mut Option<u32>,
+    scroll_id: &'static str,
 ) {
     const PID_W: f32 = 80.0;
     const CPU_W: f32 = 74.0;
@@ -2800,9 +2822,11 @@ fn process_metrics_table_full(
     });
     ui.separator();
 
+    const PROCESS_TABLE_VIEWPORT_H: f32 = 640.0;
     egui::ScrollArea::vertical()
-        .id_source("process_table_scroll")
-        .max_height(ui.available_height().max(300.0).min(400.0))
+        .id_source(scroll_id)
+        .max_height(PROCESS_TABLE_VIEWPORT_H)
+        .min_scrolled_height(PROCESS_TABLE_VIEWPORT_H)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for process in processes {
@@ -2841,7 +2865,10 @@ fn process_metrics_table_full(
                     })
                     .response;
 
-                if row_resp.interact(egui::Sense::click()).clicked() {
+                let row_click = row_resp
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if row_click.clicked() {
                     *new_expanded = if is_expanded { None } else { Some(process.pid) };
                 }
 
@@ -2873,6 +2900,7 @@ fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
         &processes.iter().take(40).cloned().collect::<Vec<_>>(),
         None,
         &mut ignored,
+        "top_process_table_scroll",
     );
 }
 
@@ -3036,13 +3064,81 @@ fn throughput_panel_heading(
     ui.add_space(6.0);
 }
 
-fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
+fn render_overview_metrics(ui: &mut egui::Ui, snapshot: &SystemSnapshot, detailed_mode: bool) {
     const MIN_CPU_MEM_COL: f32 = 168.0;
 
     let gap = ui.spacing().item_spacing.x;
     let avail_row = ui.available_width();
     let half_cpu_mem = ((avail_row - gap) * 0.5).max(0.0);
     let stack_cpu_mem = half_cpu_mem < MIN_CPU_MEM_COL;
+
+    if detailed_mode {
+        let total_disk_bw: u64 = snapshot
+            .disks
+            .iter()
+            .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec))
+            .sum();
+        let total_net_bw: u64 = snapshot
+            .network
+            .iter()
+            .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec))
+            .sum();
+        let top_proc = snapshot
+            .processes
+            .iter()
+            .max_by(|a, b| a.cpu_percent.total_cmp(&b.cpu_percent));
+        let hottest_core = snapshot
+            .cpu
+            .per_core
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b));
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Host: {}  ·  ts: {}  ·  processes: {}  ·  disks: {}  ·  nets: {}",
+                        snapshot.host_id,
+                        snapshot.timestamp,
+                        snapshot.processes.len(),
+                        snapshot.disks.len(),
+                        snapshot.network.len()
+                    ))
+                    .font(FontId::new(12.0, FontFamily::Monospace))
+                    .weak(),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Disk BW: {}/s  ·  Net BW: {}/s",
+                        human_bytes(total_disk_bw),
+                        human_bytes(total_net_bw)
+                    ))
+                    .font(FontId::new(12.0, FontFamily::Monospace)),
+                );
+                if let Some((idx, pct)) = hottest_core {
+                    ui.label(
+                        RichText::new(format!("Hottest core: CPU{idx} {pct:.1}%"))
+                            .font(FontId::new(12.0, FontFamily::Monospace)),
+                    );
+                }
+                if let Some(proc) = top_proc {
+                    ui.label(
+                        RichText::new(format!(
+                            "Top process: {} ({:.1}%, {})",
+                            proc.name,
+                            proc.cpu_percent,
+                            human_bytes(proc.memory_bytes)
+                        ))
+                        .font(FontId::new(12.0, FontFamily::Monospace)),
+                    );
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
 
     if stack_cpu_mem {
         ui.vertical(|ui| {
@@ -3524,10 +3620,18 @@ fn render_clickable_tile(ui: &mut egui::Ui, label: &str, value: String) -> bool 
                 );
             });
         });
-    resp.response
+    let click = resp
+        .response
         .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if click.hovered() {
+        ui.painter().rect_stroke(
+            click.rect,
+            6.0,
+            Stroke::new(1.0, egui::Color32::from_rgb(96, 176, 210)),
+        );
+    }
+    click.clicked()
 }
 
 const GLOSSARY_ENTRIES: &[(&str, &str)] = &[
