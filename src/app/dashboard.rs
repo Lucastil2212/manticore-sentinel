@@ -311,7 +311,7 @@ impl SentinelDashboard {
                 ui.selectable_value(&mut self.time_window, window, window.label());
             }
             ui.label(
-                RichText::new("Applies to overview, process, audit, and connector charts.").weak(),
+                RichText::new("Applies to trend and analytics charts in this view.").weak(),
             );
         });
     }
@@ -592,18 +592,20 @@ impl SentinelDashboard {
                     .iter()
                     .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec) as f64)
                     .sum();
-                push_history(
-                    &mut self.metric_history,
-                    MetricSample {
-                        ts: snapshot.timestamp,
-                        cpu_pct: snapshot.cpu.usage_percent,
-                        mem_pct,
-                        disk_bps,
-                        net_bps,
-                        process_count: snapshot.processes.len(),
-                    },
-                    METRIC_HISTORY_CAP,
-                );
+                if self.self_collect_cycles > 1 {
+                    push_history(
+                        &mut self.metric_history,
+                        MetricSample {
+                            ts: snapshot.timestamp,
+                            cpu_pct: snapshot.cpu.usage_percent,
+                            mem_pct,
+                            disk_bps,
+                            net_bps,
+                            process_count: snapshot.processes.len(),
+                        },
+                        METRIC_HISTORY_CAP,
+                    );
+                }
                 push_history(
                     &mut self.process_count_history,
                     (snapshot.timestamp, snapshot.processes.len()),
@@ -2068,11 +2070,11 @@ impl SentinelDashboard {
                 self.collapsed_sections.remove(SECTION_OVERVIEW);
                 self.scroll_to_section = Some(SECTION_OVERVIEW);
             }
-            if render_clickable_tile(ui, "DISK BW", human_bytes(total_disk_bw)) {
+            if render_clickable_tile(ui, "DISK BW", format!("{}/s", human_bytes(total_disk_bw))) {
                 self.collapsed_sections.remove(SECTION_DISK_NET);
                 self.scroll_to_section = Some(SECTION_DISK_NET);
             }
-            if render_clickable_tile(ui, "NET BW", human_bytes(total_net_bw)) {
+            if render_clickable_tile(ui, "NET BW", format!("{}/s", human_bytes(total_net_bw))) {
                 self.collapsed_sections.remove(SECTION_DISK_NET);
                 self.scroll_to_section = Some(SECTION_DISK_NET);
             }
@@ -2112,6 +2114,13 @@ impl SentinelDashboard {
                         "{}: {} ({} {:.2} / {:.2})",
                         tag, alert.rule_id, alert.message, alert.value, alert.threshold
                     ),
+                );
+            }
+            if self.self_collect_cycles < 2 {
+                ui.label(
+                    RichText::new("Collector warmup: first-sample deltas may read as 0.")
+                        .italics()
+                        .weak(),
                 );
             }
         });
@@ -2158,19 +2167,49 @@ impl SentinelDashboard {
             ProcessSort::PidAsc => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
             ProcessSort::ThreadsDesc => rows.sort_by(|a, b| b.threads.cmp(&a.threads)),
         }
-        let top_cpu: Vec<(String, f64)> = rows
+        let mut cpu_ranked = rows.clone();
+        cpu_ranked.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+        let mut rss_ranked = rows.clone();
+        rss_ranked.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+        let top_cpu: Vec<(String, f64)> = cpu_ranked
             .iter()
             .take(8)
             .map(|p| (format!("{} ({})", p.name, p.pid), p.cpu_percent as f64))
             .collect();
-        let top_rss: Vec<(String, f64)> = rows
+        let top_rss: Vec<(String, f64)> = rss_ranked
             .iter()
             .take(8)
             .map(|p| (format!("{} ({})", p.name, p.pid), p.memory_bytes as f64))
             .collect();
         ui.group(|ui| {
             ui.label(RichText::new("Process analytics").strong());
-            ui.horizontal_wrapped(|ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let avail = ui.available_width();
+            let split = (avail - gap) * 0.5;
+            if split >= 260.0 {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(split);
+                        render_horizontal_bar_chart(
+                            ui,
+                            "Top CPU processes",
+                            &top_cpu,
+                            egui::Color32::from_rgb(96, 176, 210),
+                            |v| format!("{v:.1}%"),
+                        );
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(split);
+                        render_horizontal_bar_chart(
+                            ui,
+                            "Top RSS processes",
+                            &top_rss,
+                            egui::Color32::from_rgb(196, 158, 66),
+                            |v| human_bytes(v as u64),
+                        );
+                    });
+                });
+            } else {
                 render_horizontal_bar_chart(
                     ui,
                     "Top CPU processes",
@@ -2178,6 +2217,7 @@ impl SentinelDashboard {
                     egui::Color32::from_rgb(96, 176, 210),
                     |v| format!("{v:.1}%"),
                 );
+                ui.add_space(6.0);
                 render_horizontal_bar_chart(
                     ui,
                     "Top RSS processes",
@@ -2185,7 +2225,7 @@ impl SentinelDashboard {
                     egui::Color32::from_rgb(196, 158, 66),
                     |v| human_bytes(v as u64),
                 );
-            });
+            }
             let min_ts = now_unix_secs().saturating_sub(self.time_window.seconds());
             let churn_points: Vec<(u64, f64)> = self
                 .process_churn_history
@@ -2201,11 +2241,11 @@ impl SentinelDashboard {
                 110.0,
                 |v| format!("{v:.0}/tick"),
             );
-            let proc_density: Vec<f64> = rows.iter().map(|p| p.cpu_percent as f64).take(48).collect();
-            render_distribution_bins(ui, "CPU distribution", &proc_density, 8);
+            let proc_density: Vec<f64> = rows.iter().map(|p| p.cpu_percent as f64).collect();
+            render_distribution_bins(ui, "CPU-share distribution", &proc_density, 8);
         });
         ui.label(
-            RichText::new(format!("{} processes shown", rows.len()))
+            RichText::new(format!("{} tracked processes shown", rows.len()))
                 .weak()
                 .font(FontId::new(11.5, FontFamily::Proportional)),
         );
@@ -2231,7 +2271,7 @@ impl SentinelDashboard {
                     .desired_width(280.0),
             )
             .labelled_by(lbl.id)
-            .on_hover_text("Filter current audit window by text (case-insensitive).");
+            .on_hover_text("Filter loaded audit events by text (case-insensitive).");
             ui.separator();
             ui.label("Page size");
             for sz in [25, 50, 100] {
@@ -2295,11 +2335,12 @@ impl SentinelDashboard {
         }
         ui.group(|ui| {
             ui.label(RichText::new("Audit analytics").strong());
+            let min_ts = now_unix_secs().saturating_sub(self.time_window.seconds());
             let mut by_action: std::collections::BTreeMap<String, usize> =
                 std::collections::BTreeMap::new();
             let mut hour_bins = [0usize; 24];
             let mut timeline = Vec::new();
-            for event in self.audit_feed.iter().take(240) {
+            for event in self.audit_feed.iter().filter(|e| e.ts >= min_ts).take(480) {
                 *by_action.entry(event.action.clone()).or_insert(0) += 1;
                 let hour = ((event.ts / 3600) % 24) as usize;
                 hour_bins[hour] += 1;
@@ -2312,15 +2353,13 @@ impl SentinelDashboard {
                     },
                 ));
             }
-            let bars: Vec<(String, f64)> = by_action
-                .iter()
-                .rev()
-                .take(10)
-                .map(|(k, v)| (k.clone(), *v as f64))
-                .collect();
+            let mut bars: Vec<(String, f64)> =
+                by_action.iter().map(|(k, v)| (k.clone(), *v as f64)).collect();
+            bars.sort_by(|a, b| b.1.total_cmp(&a.1));
+            bars.truncate(10);
             render_horizontal_bar_chart(
                 ui,
-                "Action frequency",
+                "Top actions by count",
                 &bars,
                 egui::Color32::from_rgb(130, 205, 235),
                 |v| format!("{v:.0}"),
@@ -2342,7 +2381,7 @@ impl SentinelDashboard {
                 .collect();
             render_line_chart(
                 ui,
-                "Deny ratio trend",
+                "Denied-event ratio trend",
                 &allow_deny_points,
                 egui::Color32::from_rgb(235, 110, 100),
                 100.0,
@@ -3034,7 +3073,7 @@ fn disk_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot, samples: &
         &disk_points,
         egui::Color32::from_rgb(130, 205, 235),
         90.0,
-        |v| human_bytes(v as u64),
+        |v| format!("{}/s", human_bytes(v as u64)),
     );
     let disk_totals: Vec<(String, f64)> = rows
         .iter()
@@ -3114,7 +3153,7 @@ fn network_throughput_rows(ui: &mut egui::Ui, snapshot: &SystemSnapshot, samples
         &net_points,
         egui::Color32::from_rgb(220, 176, 64),
         90.0,
-        |v| human_bytes(v as u64),
+        |v| format!("{}/s", human_bytes(v as u64)),
     );
     let net_totals: Vec<(String, f64)> = rows
         .iter()
@@ -3164,20 +3203,32 @@ fn process_metrics_table_full(
     new_expanded: &mut Option<u32>,
     scroll_id: &'static str,
 ) {
-    const PID_W: f32 = 80.0;
-    const CPU_W: f32 = 74.0;
-    const RSS_W: f32 = 100.0;
-    const THR_W: f32 = 70.0;
+    const BASE_PID_W: f32 = 80.0;
+    const BASE_CPU_W: f32 = 74.0;
+    const BASE_RSS_W: f32 = 100.0;
+    const BASE_THR_W: f32 = 70.0;
 
     let full = ui.available_width();
     ui.set_min_width(full);
     let sp = ui.spacing().item_spacing.x;
-    let fixed = PID_W + CPU_W + RSS_W + THR_W + sp * 4.0;
-    let name_w = (full - fixed).max(96.0);
+    let base_fixed = BASE_PID_W + BASE_CPU_W + BASE_RSS_W + BASE_THR_W + sp * 4.0;
+    let min_name = 96.0;
+    let total_needed = base_fixed + min_name;
+    let scale = if full < total_needed {
+        (full / total_needed).clamp(0.7, 1.0)
+    } else {
+        1.0
+    };
+    let pid_w = BASE_PID_W * scale;
+    let cpu_w = BASE_CPU_W * scale;
+    let rss_w = BASE_RSS_W * scale;
+    let thr_w = BASE_THR_W * scale;
+    let fixed = pid_w + cpu_w + rss_w + thr_w + sp * 4.0;
+    let name_w = (full - fixed).max(min_name * scale);
 
     ui.horizontal(|ui| {
         ui.add_sized(
-            [PID_W, 20.0],
+            [pid_w, 20.0],
             egui::Label::new(egui::RichText::new("PID").strong()),
         )
         .on_hover_text("Process ID");
@@ -3187,17 +3238,17 @@ fn process_metrics_table_full(
         )
         .on_hover_text("Executable or command name — click row for details");
         ui.add_sized(
-            [CPU_W, 20.0],
+            [cpu_w, 20.0],
             egui::Label::new(egui::RichText::new("CPU %").strong()),
         )
-        .on_hover_text("CPU time as percent of one core");
+        .on_hover_text("Process share of total host CPU time since previous sample.");
         ui.add_sized(
-            [RSS_W, 20.0],
+            [rss_w, 20.0],
             egui::Label::new(egui::RichText::new("RSS").strong()),
         )
         .on_hover_text("Resident set size (physical memory)");
         ui.add_sized(
-            [THR_W, 20.0],
+            [thr_w, 20.0],
             egui::Label::new(egui::RichText::new("Threads").strong()),
         )
         .on_hover_text("Thread count");
@@ -3216,7 +3267,7 @@ fn process_metrics_table_full(
                 let row_resp = ui
                     .horizontal_top(|ui| {
                         ui.add_sized(
-                            [PID_W, 20.0],
+                            [pid_w, 20.0],
                             egui::Label::new(process.pid.to_string()).wrap(false),
                         );
                         ui.vertical(|ui| {
@@ -3236,14 +3287,14 @@ fn process_metrics_table_full(
                             );
                         });
                         ui.add_sized(
-                            [CPU_W, 20.0],
+                            [cpu_w, 20.0],
                             egui::Label::new(format!("{:.2}", process.cpu_percent)),
                         );
                         ui.add_sized(
-                            [RSS_W, 20.0],
+                            [rss_w, 20.0],
                             egui::Label::new(human_bytes(process.memory_bytes)).wrap(false),
                         );
-                        ui.add_sized([THR_W, 20.0], egui::Label::new(process.threads.to_string()));
+                        ui.add_sized([thr_w, 20.0], egui::Label::new(process.threads.to_string()));
                     })
                     .response;
 
@@ -3474,7 +3525,7 @@ fn render_overview_metrics(
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!(
-                        "Host: {}  ·  ts: {}  ·  processes: {}  ·  disks: {}  ·  nets: {}",
+                        "Host: {}  ·  ts: {}  ·  tracked processes: {}  ·  disks: {}  ·  nets: {}",
                         snapshot.host_id,
                         snapshot.timestamp,
                         snapshot.processes.len(),
@@ -3544,7 +3595,7 @@ fn render_overview_metrics(
             .collect();
         render_line_chart(
             ui,
-            "Process count trend",
+            "Tracked process count trend",
             &process_points,
             egui::Color32::from_rgb(130, 205, 235),
             70.0,
@@ -3973,12 +4024,19 @@ fn render_horizontal_bar_chart<F: Fn(f64) -> String>(
             .map(|(_, v)| *v)
             .fold(0.0_f64, f64::max)
             .max(1.0);
+        let row_width = ui.available_width().max(160.0);
+        let label_width = (row_width * 0.42).clamp(80.0, 260.0);
+        let bar_width = (row_width - label_width - 10.0).max(60.0);
         for (label, value) in items.iter().take(8) {
             let ratio = (*value / max_val) as f32;
             ui.horizontal(|ui| {
-                ui.label(RichText::new(label).small());
+                ui.add_sized(
+                    [label_width, 18.0],
+                    egui::Label::new(RichText::new(label).small()).truncate(true),
+                )
+                .on_hover_text(label);
                 let pb = egui::ProgressBar::new(ratio)
-                    .desired_width((ui.available_width() - 90.0).max(80.0))
+                    .desired_width(bar_width)
                     .desired_height(14.0)
                     .fill(fill)
                     .text(value_fmt(*value));
