@@ -1500,56 +1500,6 @@ impl SentinelDashboard {
         }
     }
 
-    fn render_activity_section(&mut self, ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
-        ui.set_min_width(ui.available_width());
-        self.render_activity_panels(ui, snapshot);
-    }
-
-    fn render_activity_panels(&mut self, ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
-        ui.set_min_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "command-process", icons::PROCESS, 14.0);
-            ui.heading("Top Processes (CPU)")
-                .on_hover_text("Highest CPU consumers in current snapshot.");
-        });
-        if snapshot.processes.is_empty() {
-            ui.label(
-                egui::RichText::new("No process list in this snapshot.")
-                    .weak()
-                    .italics(),
-            );
-        } else {
-            process_metrics_table(ui, &snapshot.processes);
-        }
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "audit", icons::AUDIT, 14.0);
-            ui.heading("Recent Audit Events")
-                .on_hover_text("Append-only trail for helper and auth-gate outcomes.");
-        });
-        if self.last_audit_refresh.elapsed() >= Duration::from_secs(2) {
-            self.audit_feed = read_recent(&self.helper.audit_path, 12).unwrap_or_default();
-            self.last_audit_refresh = Instant::now();
-        }
-        if self.audit_feed.is_empty() {
-            ui.label(
-                egui::RichText::new(
-                    "No audit events recorded yet. Helper actions and auth denials appear here.",
-                )
-                .weak()
-                .italics(),
-            );
-        } else {
-            for event in &self.audit_feed {
-                let line = format!(
-                    "[{}] action={} target={} result={}",
-                    event.ts, event.action, event.target, event.result
-                );
-                ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap(true));
-            }
-        }
-    }
-
     fn render_connector_row(&self, ui: &mut egui::Ui, health: &crate::connectors::ConnectorHealth) {
         let mono_sm = FontId::new(12.0, FontFamily::Monospace);
         let (badge_fg, badge_bg) = match &health.status {
@@ -1663,7 +1613,7 @@ impl SentinelDashboard {
         passive.health_for(name).cloned()
     }
 
-    fn render_unified_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, central_fill_w: f32) {
+    fn render_unified_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.render_overview_quick_tiles(ui);
         ui.add_space(8.0);
 
@@ -1769,47 +1719,15 @@ impl SentinelDashboard {
         }
         ui.separator();
 
-        // --- Control + Activity (operator shell + top processes) ---
+        // --- Control (operator shell) ---
         if self.section_header(
             ui,
             SECTION_CONTROL,
             "section-command",
             icons::COMMAND,
-            "Control & Activity",
+            "Control",
         ) {
-            const CONTROL_ACTIVITY_SPLIT_PX: f32 = 1060.0;
-            if central_fill_w >= CONTROL_ACTIVITY_SPLIT_PX {
-                ui.horizontal_top(|ui| {
-                    let gap = ui.spacing().item_spacing.x;
-                    let tw = ui.available_width();
-                    let w_control = tw * 0.44;
-                    let w_activity = (tw - w_control - gap).max(220.0);
-                    ui.vertical(|ui| {
-                        ui.set_min_width(w_control);
-                        ui.set_max_width(w_control);
-                        self.render_control_section(ui, ctx);
-                    });
-                    ui.vertical(|ui| {
-                        ui.set_min_width(w_activity);
-                        ui.set_max_width(w_activity);
-                        if let Some(snapshot) = self.latest.clone() {
-                            self.render_activity_section(ui, &snapshot);
-                        } else {
-                            ui.spinner();
-                            ui.label("Collecting first snapshot...");
-                        }
-                    });
-                });
-            } else {
-                self.render_control_section(ui, ctx);
-                ui.add_space(12.0);
-                if let Some(snapshot) = self.latest.clone() {
-                    self.render_activity_section(ui, &snapshot);
-                } else {
-                    ui.spinner();
-                    ui.label("Collecting first snapshot...");
-                }
-            }
+            self.render_control_section(ui, ctx);
         }
         ui.separator();
 
@@ -2662,7 +2580,7 @@ impl eframe::App for SentinelDashboard {
                         ui.separator();
                     }
 
-                    self.render_unified_view(ui, ctx, central_fill_w);
+                    self.render_unified_view(ui, ctx);
                     self.fill_vertical_remainder(ui);
                 });
         });
@@ -2891,17 +2809,6 @@ fn process_metrics_table_full(
                 ui.add_space(2.0);
             }
         });
-}
-
-fn process_metrics_table(ui: &mut egui::Ui, processes: &[ProcessMetrics]) {
-    let mut ignored = None;
-    process_metrics_table_full(
-        ui,
-        &processes.iter().take(40).cloned().collect::<Vec<_>>(),
-        None,
-        &mut ignored,
-        "top_process_table_scroll",
-    );
 }
 
 fn cpu_util_fill(pct: f32) -> egui::Color32 {
