@@ -63,6 +63,7 @@ impl SnapshotHistoryRecord {
     }
 }
 
+#[allow(dead_code)]
 pub fn read_since(path: &Path, min_timestamp: u64) -> anyhow::Result<Vec<SystemSnapshot>> {
     let raw = match fs::read_to_string(path) {
         Ok(v) => v,

@@ -27,6 +27,10 @@ pub enum CommandAction {
     },
 }
 
+fn is_valid_process_sort(sort: &str) -> bool {
+    matches!(sort, "cpu" | "rss" | "pid" | "threads")
+}
+
 pub fn parse_command(input: &str) -> Result<CommandAction, String> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -57,15 +61,23 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             while i < rest.len() {
                 match rest[i] {
                     "--sort" if i + 1 < rest.len() => {
-                        sort = Some(rest[i + 1].to_string());
+                        let v = rest[i + 1].to_ascii_lowercase();
+                        if !is_valid_process_sort(&v) {
+                            return Err(
+                                "invalid --sort value (expected cpu|rss|pid|threads)".to_string()
+                            );
+                        }
+                        sort = Some(v);
                         i += 2;
                     }
                     "--limit" if i + 1 < rest.len() => {
-                        limit = Some(
-                            rest[i + 1]
-                                .parse::<usize>()
-                                .map_err(|_| "invalid --limit value".to_string())?,
-                        );
+                        let parsed = rest[i + 1]
+                            .parse::<usize>()
+                            .map_err(|_| "invalid --limit value".to_string())?;
+                        if parsed == 0 {
+                            return Err("--limit must be >= 1".to_string());
+                        }
+                        limit = Some(parsed);
                         i += 2;
                     }
                     _ => return Err(format!("unknown flag: {}", rest[i])),
@@ -81,6 +93,9 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             let last = n
                 .parse::<usize>()
                 .map_err(|_| "invalid --last value".to_string())?;
+            if last == 0 {
+                return Err("--last must be >= 1".to_string());
+            }
             Ok(CommandAction::ShowAudit {
                 last: last.min(200),
             })
@@ -512,6 +527,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_show_processes_sort() {
+        let err = parse_command("show processes --sort bogus").expect_err("should reject");
+        assert!(err.contains("invalid --sort"));
+    }
+
+    #[test]
+    fn rejects_zero_show_processes_limit() {
+        let err = parse_command("show processes --limit 0").expect_err("should reject");
+        assert!(err.contains("--limit"));
+    }
+
+    #[test]
     fn parses_help_with_topic() {
         let action = parse_command("help config").expect("should parse");
         match action {
@@ -527,6 +554,12 @@ mod tests {
             CommandAction::ShowAudit { last } => assert_eq!(last, 50),
             _ => panic!("unexpected action"),
         }
+    }
+
+    #[test]
+    fn rejects_zero_show_audit_last() {
+        let err = parse_command("show audit --last 0").expect_err("should reject");
+        assert!(err.contains("--last"));
     }
 
     #[test]

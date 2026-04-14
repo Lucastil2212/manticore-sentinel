@@ -302,7 +302,7 @@ impl SentinelDashboard {
             auth_gate,
             auth_failures: 0,
             auth_locked_until: None,
-            show_onboarding: true,
+            show_onboarding: false,
             show_help_center: false,
             runtime_diagnostics,
             last_command_feedback_announced: None,
@@ -569,6 +569,27 @@ impl SentinelDashboard {
 
     fn execute_read_only_command(&self, action: &CommandAction) -> Option<String> {
         match action {
+            CommandAction::ShowCpu => {
+                let snap = self.latest.as_ref()?;
+                let mut out = String::new();
+                out.push_str(&format!("CPU: {:.2}%\n", snap.cpu.usage_percent));
+                out.push_str(&format!(
+                    "Load avg: {:.2} {:.2} {:.2}\n",
+                    snap.cpu.load_avg.0, snap.cpu.load_avg.1, snap.cpu.load_avg.2
+                ));
+                if snap.cpu.per_core.is_empty() {
+                    out.push_str("Per-core: unavailable");
+                } else {
+                    out.push_str("Per-core (%): ");
+                    for (idx, pct) in snap.cpu.per_core.iter().enumerate() {
+                        if idx > 0 {
+                            out.push_str("  ");
+                        }
+                        out.push_str(&format!("{idx}:{pct:.1}"));
+                    }
+                }
+                Some(out)
+            }
             CommandAction::ShowMemory => {
                 let snap = self.latest.as_ref()?;
                 let m = &snap.memory;
@@ -942,7 +963,7 @@ impl SentinelDashboard {
     }
 
     fn quick_status_chips(&self, ui: &mut egui::Ui) {
-        let body = FontId::new(15.0, FontFamily::Proportional);
+        let body = FontId::new(13.5, FontFamily::Proportional);
         match &self.latest {
             Some(s) => {
                 let mem_ratio = if s.memory.total == 0 {
@@ -979,27 +1000,12 @@ impl SentinelDashboard {
         let panel_w = ui.available_width();
         ui.set_min_width(panel_w);
 
-        let shell_inset = egui::Margin::symmetric(12.0, 10.0);
+        let shell_inset = egui::Margin::symmetric(10.0, 8.0);
         let shell_fill = egui::Color32::from_rgb(16, 20, 26);
         let shell_stroke = Stroke::new(1.0, egui::Color32::from_rgb(52, 66, 84));
-        let mono = FontId::new(16.0, FontFamily::Monospace);
-        let mono_hint = FontId::new(12.0, FontFamily::Monospace);
+        let mono = FontId::new(14.0, FontFamily::Monospace);
+        let mono_hint = FontId::new(11.5, FontFamily::Monospace);
         let prompt_color = egui::Color32::from_rgb(110, 198, 224);
-
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "command", icons::COMMAND, 15.0);
-            ui.label(
-                RichText::new("Operator shell")
-                    .strong()
-                    .font(FontId::new(14.5, FontFamily::Proportional)),
-            );
-        });
-        ui.label(
-            RichText::new("Structured commands only — no pipes, redirects, or subshells.")
-                .weak()
-                .font(FontId::new(12.5, FontFamily::Proportional)),
-        );
-        ui.add_space(6.0);
 
         if self.auth_gate.context().mode == AuthMode::Token {
             egui::Frame::none()
@@ -1017,37 +1023,29 @@ impl SentinelDashboard {
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 76, 70),
                             format!(
-                                "Auth lockout active: {} failures, retry in {}s",
+                                "Auth lockout: {} failures, retry in {}s",
                                 self.auth_failures, remaining
                             ),
                         );
                     } else if self.auth_failures > 0 {
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 176, 64),
-                            format!(
-                                "Auth failures: {} (lockout after 3 consecutive failures)",
-                                self.auth_failures
-                            ),
-                        );
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(96, 176, 210),
-                            "Auth status: ready",
+                            format!("Auth failures: {} (lockout after 3)", self.auth_failures),
                         );
                     }
-                    ui.add_space(4.0);
-                    let tok_lbl = ui
-                        .label(RichText::new("Token").font(mono_hint.clone()))
-                        .on_hover_text("Required in token mode. Input is masked.");
-                    let token_w = ui.available_width().max(120.0);
-                    let te = egui::TextEdit::singleline(&mut self.auth_token_input)
-                        .font(mono_hint.clone())
-                        .password(true)
-                        .hint_text("paste token")
-                        .desired_width(token_w);
-                    ui.add(te).labelled_by(tok_lbl.id);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Token").font(mono_hint.clone()));
+                        let token_w = ui.available_width().max(120.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.auth_token_input)
+                                .font(mono_hint.clone())
+                                .password(true)
+                                .hint_text("paste auth token…")
+                                .desired_width(token_w),
+                        );
+                    });
                 });
-            ui.add_space(8.0);
+            ui.add_space(4.0);
         }
 
         egui::Frame::none()
@@ -1057,17 +1055,10 @@ impl SentinelDashboard {
             .stroke(shell_stroke)
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.label(
-                    RichText::new("Tab complete · ↑ / ↓ history · Enter run · ⌘K focus")
-                        .weak()
-                        .font(mono_hint.clone()),
-                )
-                .on_hover_text("Same spirit as a modern terminal: keyboard-first, no raw shell.");
-                ui.add_space(6.0);
 
                 let cmd_row_room = ui.available_width();
-                let run_reserve = 76.0 + ui.spacing().item_spacing.x * 2.0;
-                let prompt_reserve = 108.0;
+                let run_reserve = 60.0 + ui.spacing().item_spacing.x * 2.0;
+                let prompt_reserve = 90.0;
                 let edit_w = (cmd_row_room - run_reserve - prompt_reserve).max(120.0);
 
                 let mut run_clicked = false;
@@ -1083,30 +1074,23 @@ impl SentinelDashboard {
                     let te = egui::TextEdit::singleline(&mut self.command_input)
                         .id(egui::Id::new(ID_COMMAND_INPUT))
                         .font(mono.clone())
-                        .hint_text("show cpu")
+                        .hint_text("type a command... (Tab complete, arrow keys history)")
                         .desired_width(edit_w);
-                    let r = ui.add(te).on_hover_text(
-                        "Enter runs the line. Tab fills the first matching built-in.",
-                    );
+                    let r = ui.add(te);
                     // Single-line TextEdit: Enter must be detected while focused (lost_focus + Enter
                     // often never align in the same frame).
                     enter_run =
                         ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) && r.has_focus();
-                    let run = ui
-                        .add_sized(
-                            [68.0, 30.0],
-                            egui::Button::new(
-                                RichText::new("Run")
-                                    .strong()
-                                    .font(FontId::new(13.5, FontFamily::Proportional)),
-                            )
-                            .fill(egui::Color32::from_rgb(52, 98, 128))
-                            .stroke(Stroke::new(1.0, egui::Color32::from_rgb(72, 118, 148))),
+                    let run = ui.add_sized(
+                        [54.0, 24.0],
+                        egui::Button::new(
+                            RichText::new("Run")
+                                .strong()
+                                .font(FontId::new(12.0, FontFamily::Proportional)),
                         )
-                        .on_hover_text("Run the current line (same as Enter).");
-                    run.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, "Run command")
-                    });
+                        .fill(egui::Color32::from_rgb(52, 98, 128))
+                        .stroke(Stroke::new(1.0, egui::Color32::from_rgb(72, 118, 148))),
+                    );
                     run_clicked = run.clicked();
                     r
                 });
@@ -1130,73 +1114,20 @@ impl SentinelDashboard {
                     self.run_command_palette_action();
                 }
 
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Quick actions")
-                        .weak()
-                        .font(mono_hint.clone()),
-                );
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if ui
-                        .button(RichText::new("show cpu").font(mono_hint.clone()))
-                        .on_hover_text("Run read-only CPU snapshot (most common).")
-                        .clicked()
-                    {
-                        self.command_input = "show cpu".to_string();
-                        self.run_command_palette_action();
-                    }
-                    if ui
-                        .button(RichText::new("renice …").font(mono_hint.clone()))
-                        .on_hover_text("Insert template: renice <nice> <pid>  (nice −20…19).")
-                        .clicked()
-                    {
-                        self.command_input = "renice 0 ".to_string();
-                        ctx.memory_mut(|m| {
-                            m.request_focus(egui::Id::new(ID_COMMAND_INPUT));
-                        });
-                    }
-                    if self.trust_state == "PRIVILEGED" {
-                        if ui
-                            .button(RichText::new("kill …").font(mono_hint.clone()))
-                            .on_hover_text("Insert template: kill <pid>  (requires typed confirm).")
-                            .clicked()
-                        {
-                            self.command_input = "kill ".to_string();
-                            ctx.memory_mut(|m| {
-                                m.request_focus(egui::Id::new(ID_COMMAND_INPUT));
-                            });
-                        }
-                    } else {
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(RichText::new("kill …").font(mono_hint.clone())),
-                        )
-                        .on_hover_text("Privileged mode only (kill is capability-gated).");
-                    }
-                });
-
                 let comps = filtered_command_completions(&self.command_input);
                 let show_chips = !comps.is_empty()
                     && !(comps.len() == 1 && comps[0] == self.command_input.trim());
                 if show_chips {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Suggestions").weak().font(mono_hint.clone()));
-                    ui.add_space(4.0);
+                    ui.add_space(3.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         for c in comps {
                             let lbl: &'static str = match c {
                                 "renice " => "renice <nice> <pid>",
                                 "kill " => "kill <pid>",
                                 _ => c,
                             };
-                            if ui
-                                .small_button(lbl)
-                                .on_hover_text(format!("Insert `{c}`"))
-                                .clicked()
-                            {
+                            if ui.small_button(lbl).clicked() {
                                 self.command_input = c.to_string();
                             }
                         }
@@ -1205,7 +1136,7 @@ impl SentinelDashboard {
             });
 
         if let Some(CommandAction::KillProcess { pid }) = self.pending_action.clone() {
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             let required = format!("KILL {}", pid);
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(36, 18, 18))
@@ -1215,11 +1146,10 @@ impl SentinelDashboard {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(
-                        RichText::new(format!("Destructive action — type `{required}` to confirm"))
+                        RichText::new(format!("Type \"{required}\" to confirm destructive action"))
                             .color(egui::Color32::from_rgb(255, 190, 175))
-                            .font(FontId::new(13.0, FontFamily::Proportional)),
+                            .font(FontId::new(12.5, FontFamily::Proportional)),
                     );
-                    ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         let kill_lbl = ui.label(RichText::new("confirm").font(mono_hint.clone()));
                         let confirm_w =
@@ -1297,7 +1227,7 @@ impl SentinelDashboard {
         }
 
         if let Some(msg) = &self.command_feedback {
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             if self.last_command_feedback_announced.as_ref() != Some(msg) {
                 self.last_command_feedback_announced = Some(msg.clone());
                 let mut info = egui::WidgetInfo::new(egui::WidgetType::Label);
@@ -1329,45 +1259,34 @@ impl SentinelDashboard {
                 .stroke(out_stroke)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.label(RichText::new("Output").weak().font(mono_hint.clone()));
-                    ui.add_space(4.0);
                     let out_text = egui::Color32::from_rgb(232, 238, 246);
                     egui::ScrollArea::vertical()
                         .id_source("command_output_scroll")
-                        .max_height(420.0)
-                        .auto_shrink([false, true])
+                        .max_height(220.0)
+                        .auto_shrink([true, true])
                         .show(ui, |ui| {
-                    let status = ui
-                        .add(
-                            egui::Label::new(
-                                RichText::new(msg.as_str())
-                                    .font(mono.clone())
-                                    .color(out_text),
-                            )
-                            .wrap(true)
-                            .sense(egui::Sense::hover()),
-                        )
-                        .on_hover_text(
-                            "Latest command outcome; assistive tech is notified when this text changes.",
-                        );
-                    status.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("Command result: {msg}"))
-                    });
-                    });
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(msg.as_str())
+                                        .font(mono.clone())
+                                        .color(out_text),
+                                )
+                                .wrap(true),
+                            );
+                        });
                 });
         }
 
         if !self.command_history.is_empty() {
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             ui.label(
-                RichText::new("Session history (newest first)")
+                RichText::new("History")
                     .weak()
                     .font(mono_hint.clone()),
             );
-            ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .id_source("session_cmd_history_scroll")
-                .max_height(200.0)
+                .max_height(120.0)
                 .auto_shrink([true, true])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -1444,12 +1363,6 @@ impl SentinelDashboard {
 
     fn render_control_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.set_min_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "section-command", icons::COMMAND, 18.0);
-            ui.heading("Control");
-        });
-        ui.label(egui::RichText::new("Operator shell, auth, and block-style output.").weak());
-        ui.add_space(8.0);
         self.render_command_workbench(ui, ctx);
     }
 
@@ -1589,12 +1502,6 @@ impl SentinelDashboard {
 
     fn render_activity_section(&mut self, ui: &mut egui::Ui, snapshot: &SystemSnapshot) {
         ui.set_min_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, "section-activity", icons::AUDIT, 18.0);
-            ui.heading("Activity");
-        });
-        ui.label(egui::RichText::new("Top processes and append-only audit trail.").weak());
-        ui.add_space(8.0);
         self.render_activity_panels(ui, snapshot);
     }
 
@@ -1706,13 +1613,13 @@ impl SentinelDashboard {
     ) -> bool {
         let is_collapsed = self.collapsed_sections.contains(section_id);
         let indicator = if is_collapsed { "▸" } else { "▾" };
-        let resp = ui.horizontal_wrapped(|ui| {
-            icons::paint(ui, icon_key, icon_svg, 16.0);
+        let resp = ui.horizontal(|ui| {
+            icons::paint(ui, icon_key, icon_svg, 14.0);
             let btn = ui.add(
                 egui::Label::new(
                     RichText::new(format!("{indicator} {title}"))
                         .strong()
-                        .font(FontId::new(15.0, FontFamily::Proportional)),
+                        .font(FontId::new(14.0, FontFamily::Proportional)),
                 )
                 .sense(egui::Sense::click()),
             );
@@ -2181,7 +2088,7 @@ impl SentinelDashboard {
 
         egui::ScrollArea::vertical()
             .id_source("audit_events_scroll_unified")
-            .max_height(400.0)
+            .max_height(280.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (view_idx, event) in filtered[start..end].iter().enumerate() {
@@ -2489,90 +2396,69 @@ impl eframe::App for SentinelDashboard {
             apply_security_visuals(ctx);
             self.visuals_applied = true;
         }
+        suppress_debug_overlays(ctx);
         self.poll();
         self.handle_global_shortcuts(ctx);
         ctx.request_repaint_after(self.ui_repaint_interval);
 
-        let screen = ctx.screen_rect();
-        let top_scroll_cap = (screen.height() * 0.42).clamp(72.0, 320.0);
-
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical()
-                .id_source("top_bar_vscroll")
-                .max_height(top_scroll_cap)
-                .auto_shrink([true, true])
-                .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal_wrapped(|ui| {
-                            icons::paint(ui, "mark", icons::MARK, 24.0);
-                            ui.label(
-                                RichText::new("Manticore Sentinel")
-                                    .strong()
-                                    .font(FontId::new(18.0, FontFamily::Proportional)),
-                            );
-                            ui.separator();
-                            self.quick_status_chips(ui);
-                        });
-                        ui.add_space(6.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "Mode: OPERATOR  ·  Trust: {}  ·  Auth: {}  ·  Audit: APPEND-ONLY",
-                                    self.trust_badge_text(),
-                                    self.auth_mode_label
-                                ))
-                                .font(FontId::new(13.5, FontFamily::Proportional)),
-                            )
-                            .wrap(true),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            icons::paint(ui, "security-guide-icon", icons::SHIELD, 14.0);
-                            let guide = ui
-                                .button("Security Guide")
-                                .on_hover_text("Open security posture and destructive-action guidance.");
-                            guide.widget_info(|| {
-                                egui::WidgetInfo::labeled(egui::WidgetType::Button, "Security Guide")
-                            });
-                            if guide.clicked() {
-                                self.show_onboarding = true;
-                            }
-                            icons::paint(ui, "help-center-icon", icons::HELP, 14.0);
-                            let help = ui
-                                .button("Help Center")
-                                .on_hover_text("Open full in-app navigation and command help (F1).");
-                            help.widget_info(|| {
-                                egui::WidgetInfo::labeled(egui::WidgetType::Button, "Help Center")
-                            });
-                            if help.clicked() {
-                                self.show_help_center = true;
-                            }
-                            ui.separator();
-                            let mode_label = if self.detailed_mode {
-                                "Detailed"
-                            } else {
-                                "Compact"
-                            };
-                            if ui
-                                .small_button(mode_label)
-                                .on_hover_text("Toggle between compact (beginner) and detailed (advanced) view")
-                                .clicked()
-                            {
-                                self.detailed_mode = !self.detailed_mode;
-                            }
-                            if ui
-                                .small_button("Glossary")
-                                .on_hover_text("Open glossary of technical terms")
-                                .clicked()
-                            {
-                                self.show_glossary = true;
-                            }
-                        });
-                    });
-                });
             ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                icons::paint(ui, "mark", icons::MARK, 20.0);
+                ui.label(
+                    RichText::new("Manticore Sentinel")
+                        .strong()
+                        .font(FontId::new(16.0, FontFamily::Proportional)),
+                );
+                ui.separator();
+                self.quick_status_chips(ui);
+            });
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Mode: OPERATOR  ·  Trust: {}  ·  Auth: {}  ·  Audit: APPEND-ONLY",
+                        self.trust_badge_text(),
+                        self.auth_mode_label
+                    ))
+                    .weak()
+                    .font(FontId::new(11.5, FontFamily::Proportional)),
+                );
+            });
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("Security Guide")
+                    .on_hover_text("Security posture and destructive-action guidance")
+                    .clicked()
+                {
+                    self.show_onboarding = true;
+                }
+                if ui
+                    .small_button("Help Center")
+                    .on_hover_text("In-app navigation and command help (F1)")
+                    .clicked()
+                {
+                    self.show_help_center = true;
+                }
+                ui.separator();
+                let mode_label = if self.detailed_mode { "Detailed" } else { "Compact" };
+                if ui
+                    .small_button(mode_label)
+                    .on_hover_text("Toggle compact/detailed view")
+                    .clicked()
+                {
+                    self.detailed_mode = !self.detailed_mode;
+                }
+                if ui
+                    .small_button("Glossary")
+                    .on_hover_text("Technical terms glossary")
+                    .clicked()
+                {
+                    self.show_glossary = true;
+                }
+            });
+            ui.add_space(3.0);
         });
 
         if !self.config_warnings.is_empty() && !self.config_warnings_dismissed {
@@ -2916,7 +2802,7 @@ fn process_metrics_table_full(
 
     egui::ScrollArea::vertical()
         .id_source("process_table_scroll")
-        .max_height(ui.available_height().max(500.0))
+        .max_height(ui.available_height().max(300.0).min(400.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for process in processes {
@@ -3478,6 +3364,23 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Suppress all egui debug/diagnostic overlays every frame.
+/// In debug builds egui defaults `warn_on_id_clash = true` which paints red
+/// "First use of widget ID …" rectangles whenever two widgets share an ID.
+/// The style-level debug flags are a separate layer on top.
+fn suppress_debug_overlays(ctx: &egui::Context) {
+    ctx.options_mut(|opt| opt.warn_on_id_clash = false);
+    ctx.style_mut(|style| {
+        style.debug.debug_on_hover = false;
+        style.debug.debug_on_hover_with_all_modifiers = false;
+        style.debug.show_expand_width = false;
+        style.debug.show_expand_height = false;
+        style.debug.show_resize = false;
+        style.debug.show_interactive_widgets = false;
+        style.debug.show_widget_hits = false;
+    });
+}
+
 fn apply_security_visuals(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.override_text_color = Some(egui::Color32::from_rgb(214, 222, 230));
@@ -3495,16 +3398,16 @@ fn apply_security_visuals(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 
     ctx.style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-        style.spacing.window_margin = egui::Margin::same(12.0);
+        style.spacing.item_spacing = egui::vec2(6.0, 5.0);
+        style.spacing.button_padding = egui::vec2(10.0, 4.0);
+        style.spacing.window_margin = egui::Margin::same(10.0);
         style.text_styles.insert(
             egui::TextStyle::Body,
-            FontId::new(14.0, FontFamily::Proportional),
+            FontId::new(13.5, FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Small,
-            FontId::new(12.5, FontFamily::Proportional),
+            FontId::new(12.0, FontFamily::Proportional),
         );
     });
 }

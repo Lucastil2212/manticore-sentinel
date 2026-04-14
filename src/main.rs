@@ -77,7 +77,8 @@ fn load_profile_env(profile: &str) -> anyhow::Result<()> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
-            std::env::set_var(k.trim(), v.trim());
+            // SAFETY: called before any threads are spawned (early main, single-threaded).
+            unsafe { std::env::set_var(k.trim(), v.trim()) };
         }
     }
     tracing::debug!(profile = %profile, path = %path.display(), "profile environment applied");
