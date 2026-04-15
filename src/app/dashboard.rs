@@ -325,6 +325,10 @@ impl SentinelDashboard {
             .collect()
     }
 
+    fn metric_window_samples_owned(&self) -> Vec<MetricSample> {
+        self.metric_window_samples().into_iter().cloned().collect()
+    }
+
     fn current_actor(&self) -> String {
         self.evrus_jwt
             .as_deref()
@@ -1882,6 +1886,7 @@ impl SentinelDashboard {
     }
 
     fn render_unified_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let window_samples = self.metric_window_samples_owned();
         self.render_overview_quick_tiles(ui);
         self.render_time_window_selector(ui);
         ui.add_space(8.0);
@@ -1904,8 +1909,8 @@ impl SentinelDashboard {
             );
             ui.add_space(4.0);
             if let Some(snapshot) = &self.latest {
-                let samples = self.metric_window_samples();
-                render_overview_metrics(ui, snapshot, &samples, self.detailed_mode);
+                let sample_refs: Vec<&MetricSample> = window_samples.iter().collect();
+                render_overview_metrics(ui, snapshot, &sample_refs, self.detailed_mode);
             } else {
                 ui.spinner();
                 ui.label("Collecting first snapshot...");
@@ -1935,7 +1940,8 @@ impl SentinelDashboard {
                             "Disk throughput",
                             "Per-device read/write rates.",
                         );
-                        disk_throughput_rows(ui, snapshot, &self.metric_window_samples());
+                        let sample_refs: Vec<&MetricSample> = window_samples.iter().collect();
+                        disk_throughput_rows(ui, snapshot, &sample_refs);
                     });
                     ui.add_space(8.0);
                     ui.group(|ui| {
@@ -1947,7 +1953,8 @@ impl SentinelDashboard {
                             "Network throughput",
                             "Per-interface receive/transmit rates.",
                         );
-                        network_throughput_rows(ui, snapshot, &self.metric_window_samples());
+                        let sample_refs: Vec<&MetricSample> = window_samples.iter().collect();
+                        network_throughput_rows(ui, snapshot, &sample_refs);
                     });
                 } else {
                     ui.horizontal(|ui| {
@@ -1963,7 +1970,8 @@ impl SentinelDashboard {
                                     "Disk throughput",
                                     "Per-device read/write rates.",
                                 );
-                                disk_throughput_rows(ui, snapshot, &self.metric_window_samples());
+                                let sample_refs: Vec<&MetricSample> = window_samples.iter().collect();
+                                disk_throughput_rows(ui, snapshot, &sample_refs);
                             });
                         });
                         ui.vertical(|ui| {
@@ -1977,7 +1985,8 @@ impl SentinelDashboard {
                                     "Network throughput",
                                     "Per-interface receive/transmit rates.",
                                 );
-                                network_throughput_rows(ui, snapshot, &self.metric_window_samples());
+                                let sample_refs: Vec<&MetricSample> = window_samples.iter().collect();
+                                network_throughput_rows(ui, snapshot, &sample_refs);
                             });
                         });
                     });
@@ -2231,7 +2240,7 @@ impl SentinelDashboard {
                 .process_churn_history
                 .iter()
                 .filter(|(ts, _, _)| *ts >= min_ts)
-                .map(|(ts, started, exited)| (*ts, (*started + *exited) as f64))
+                .map(|(ts, started, exited)| (*ts, started.saturating_add(*exited) as f64))
                 .collect();
             render_line_chart(
                 ui,
@@ -2409,10 +2418,14 @@ impl SentinelDashboard {
             .collect();
 
         let total = filtered.len();
-        let total_pages = (total + self.audit_page_size - 1) / self.audit_page_size.max(1);
-        if self.audit_page >= total_pages && total_pages > 0 {
-            self.audit_page = total_pages - 1;
+        if total == 0 {
+            self.audit_page = 0;
+            self.expanded_audit_idx = None;
+            ui.label(RichText::new("No audit events match current filters/window.").weak());
+            return;
         }
+        let total_pages = (total + self.audit_page_size - 1) / self.audit_page_size.max(1);
+        self.audit_page = self.audit_page.min(total_pages.saturating_sub(1));
         let start = self.audit_page * self.audit_page_size;
         let end = (start + self.audit_page_size).min(total);
 
@@ -3938,8 +3951,8 @@ fn render_line_chart<F: Fn(f64) -> String>(
     }
     let width = ui.available_width().max(140.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let min_x = points.first().map(|p| p.0).unwrap_or(0) as f64;
-    let max_x = points.last().map(|p| p.0).unwrap_or(1) as f64;
+    let min_x = points.iter().map(|p| p.0).min().unwrap_or(0) as f64;
+    let max_x = points.iter().map(|p| p.0).max().unwrap_or(1).max(min_x as u64 + 1) as f64;
     let min_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let raw_max_y = points
         .iter()
@@ -3958,7 +3971,7 @@ fn render_line_chart<F: Fn(f64) -> String>(
         let tx = if (max_x - min_x).abs() < f64::EPSILON {
             0.0_f64
         } else {
-            (x as f64 - min_x) / (max_x - min_x)
+            ((x as f64 - min_x) / (max_x - min_x)).clamp(0.0, 1.0)
         };
         let ty = ((y - min_plot_y) / (max_y - min_plot_y)).clamp(0.0, 1.0);
         egui::pos2(
@@ -4104,15 +4117,21 @@ fn render_timeline(ui: &mut egui::Ui, title: &str, points: &[(u64, f64)], height
     }
     let width = ui.available_width().max(120.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let min_ts = points.first().map(|p| p.0).unwrap_or(0);
-    let max_ts = points.last().map(|p| p.0).unwrap_or(min_ts + 1).max(min_ts + 1);
+    let min_ts = points.iter().map(|p| p.0).min().unwrap_or(0);
+    let max_ts = points
+        .iter()
+        .map(|p| p.0)
+        .max()
+        .unwrap_or(min_ts.saturating_add(1))
+        .max(min_ts.saturating_add(1));
+    let span = (max_ts - min_ts).max(1) as f32;
     ui.painter().rect_stroke(
         rect,
         4.0,
         Stroke::new(1.0, egui::Color32::from_rgb(46, 64, 80)),
     );
     for (ts, mark) in points.iter().take(160) {
-        let t = (*ts - min_ts) as f32 / (max_ts - min_ts) as f32;
+        let t = ts.saturating_sub(min_ts) as f32 / span;
         let x = rect.left() + t * rect.width();
         let color = if *mark > 0.5 {
             egui::Color32::from_rgb(225, 90, 90)
