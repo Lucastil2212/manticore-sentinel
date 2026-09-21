@@ -15,6 +15,11 @@ pub enum CommandAction {
         last: usize,
     },
     ShowStorage,
+    Search {
+        query: String,
+        mode: Option<String>,
+    },
+    ShowObservability,
     Help {
         topic: Option<String>,
     },
@@ -101,6 +106,35 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
             })
         }
         ["show", "storage"] => Ok(CommandAction::ShowStorage),
+        ["show", "observability"] | ["show", "observe"] => Ok(CommandAction::ShowObservability),
+        ["search"] => Ok(CommandAction::Search {
+            query: String::new(),
+            mode: None,
+        }),
+        ["search", rest @ ..] => {
+            let mut mode = None;
+            let mut terms = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == "--mode" && i + 1 < rest.len() {
+                    let v = rest[i + 1].to_ascii_lowercase();
+                    if !matches!(v.as_str(), "hybrid" | "fts" | "vector" | "semantic") {
+                        return Err(
+                            "invalid --mode value (expected hybrid|fts|vector)".to_string()
+                        );
+                    }
+                    mode = Some(v);
+                    i += 2;
+                } else {
+                    terms.push(rest[i]);
+                    i += 1;
+                }
+            }
+            Ok(CommandAction::Search {
+                query: terms.join(" "),
+                mode,
+            })
+        }
         ["help"] => Ok(CommandAction::Help { topic: None }),
         ["help", topic] => Ok(CommandAction::Help {
             topic: Some(topic.to_string()),
@@ -143,6 +177,11 @@ pub const COMMAND_COMPLETIONS: &[&str] = &[
     "show audit",
     "show audit --last 50",
     "show storage",
+    "show observability",
+    "search ",
+    "search --mode hybrid ",
+    "search --mode fts ",
+    "search --mode vector ",
     "help",
     "help commands",
     "help config",
@@ -168,9 +207,10 @@ pub fn help_text(topic: Option<&str>) -> String {
         Some("alerts") | Some("alert") => HELP_ALERTS.to_string(),
         Some("audit") => HELP_AUDIT.to_string(),
         Some("sse") | Some("stream") => HELP_SSE.to_string(),
+        Some("search") | Some("fts") => HELP_SEARCH.to_string(),
         Some("profiles") | Some("profile") => HELP_PROFILES.to_string(),
         Some(other) => format!(
-            "Unknown topic: '{other}'. Available: commands, config, connectors, peerweave, evrus, auth, alerts, audit, sse, profiles"
+            "Unknown topic: '{other}'. Available: commands, config, connectors, peerweave, evrus, auth, alerts, audit, sse, search, profiles"
         ),
     }
 }
@@ -189,8 +229,10 @@ COMMANDS:
   show connectors   Ecosystem connector status
   show audit        Recent audit events (--last N, default 10)
   show storage      File sizes and retention status
+  search [query]    Hybrid FTS + vector discovery (--mode hybrid|fts|vector)
+  show observability Self-health, store stats, and logging series
   help [topic]      In-app documentation (topics: commands, config, connectors,
-                    peerweave, evrus, auth, alerts, audit, sse, profiles)
+                    peerweave, evrus, auth, alerts, audit, sse, search, profiles)
   kill <pid>        Kill a process (requires confirmation + privilege)
   renice <n> <pid>  Change process priority (-20..19)
 
@@ -232,9 +274,16 @@ show storage
   Displays file sizes, entry counts, and retention config for
   audit events, snapshots, and archive files.
 
+search [query] [--mode hybrid|fts|vector]
+  Hybrid discovery across host snapshots, processes, connectors, and logs.
+  Default mode fuses SQLite FTS5 with hashed n-gram vectors.
+
+show observability | show observe
+  Collector latency, store occupancy, and logging analytics.
+
 help [topic]
   Shows documentation. Topics: commands, config, connectors,
-  peerweave, evrus, auth, alerts, audit, sse, profiles.
+  peerweave, evrus, auth, alerts, audit, sse, search, profiles.
 
 kill <pid>
   Sends SIGKILL to the specified process. Requires operator/admin role,
@@ -274,6 +323,14 @@ Retention:
 SSE:
   MANTICORE_EVENT_STREAM_ENABLED   true|false (default: false)
   MANTICORE_EVENT_STREAM_PORT      port number (default: 9462)
+
+Storage / search:
+  MANTICORE_STORE_ENABLED          true|false (default: true)
+  MANTICORE_STORE_PATH             SQLite WAL path
+  MANTICORE_SEARCH_ENABLED         true|false (default: true)
+  MANTICORE_OBS_HTTP_ENABLED       true|false (default: false; on with --headless)
+  MANTICORE_OBS_HTTP_PORT          default 9463
+  MANTICORE_LOG_JSON               true|false structured tracing
 
 PeerWeave:
   MANTICORE_PEERWEAVE_ENABLED      true|false
@@ -440,8 +497,33 @@ Test with curl:
   curl -N http://localhost:9462/
 
 Events are streamed as 'event: telemetry' frames with JSON payloads
-containing the current SystemSnapshot. Auth is inherited from the
-configured MANTICORE_AUTH_MODE.";
+  containing the current SystemSnapshot. Auth is inherited from the
+  configured MANTICORE_AUTH_MODE.";
+
+const HELP_SEARCH: &str = "\
+SEARCH — hybrid FTS, vector, and semantic discovery
+
+Telemetry is indexed into a local SQLite WAL store:
+  FTS5 lexical match on host, process, connector, and audit documents
+  Hashed character n-gram embeddings (64-d) with cosine ranking
+  Reciprocal-rank fusion for --mode hybrid (default)
+
+Examples:
+  search nginx
+  search --mode fts sshd
+  search --mode vector high cpu process
+
+Observability HTTP (optional, always on with --headless):
+  GET /health
+  GET /metrics
+  GET /api/search?q=nginx&mode=hybrid
+  GET /api/discover
+  GET /api/metrics/series
+  GET /api/logs
+
+Docker:
+  docker compose --profile stack up -d
+  docker compose --profile sentinel up -d";
 
 const HELP_PROFILES: &str = "\
 PROFILES — runtime configuration presets
@@ -566,5 +648,17 @@ mod tests {
     fn unknown_command_suggests_help() {
         let err = parse_command("foo bar").expect_err("should reject");
         assert!(err.contains("help"));
+    }
+
+    #[test]
+    fn parses_hybrid_search() {
+        let action = parse_command("search --mode fts nginx worker").expect("should parse");
+        match action {
+            CommandAction::Search { query, mode } => {
+                assert_eq!(query, "nginx worker");
+                assert_eq!(mode.as_deref(), Some("fts"));
+            }
+            _ => panic!("unexpected action"),
+        }
     }
 }

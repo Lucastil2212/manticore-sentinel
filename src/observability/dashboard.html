@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Manticore Sentinel Observability</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0d1218; --panel:#161d26; --ink:#d6dee6; --muted:#8a97a5; --line:#2d3e4e; --accent:#60b0d2; --warn:#c49e42; --crit:#b44242; }
+    * { box-sizing: border-box; }
+    body { margin:0; font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+    header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    h1 { font-size:16px; margin:0; }
+    .muted { color:var(--muted); }
+    main { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:12px; padding:16px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+    h2 { font-size:13px; margin:0 0 8px; }
+    canvas { width:100%; height:120px; background:#0b1016; border-radius:4px; }
+    input, select, button { background:#13212c; color:var(--ink); border:1px solid var(--line); border-radius:4px; padding:6px 8px; }
+    button { cursor:pointer; }
+    table { width:100%; border-collapse:collapse; }
+    td, th { text-align:left; padding:4px 6px; border-bottom:1px solid #22303c; font-size:12px; }
+    .chips { display:flex; gap:8px; flex-wrap:wrap; }
+    .chip { background:#13212c; border:1px solid var(--line); border-radius:999px; padding:4px 10px; }
+    .search-row { display:flex; gap:8px; margin-bottom:8px; }
+    .search-row input { flex:1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Manticore Sentinel · Observability</h1>
+      <div class="muted" id="health">loading…</div>
+    </div>
+    <div class="chips" id="chips"></div>
+  </header>
+  <main>
+    <section>
+      <h2>Live host series</h2>
+      <canvas id="cpu"></canvas>
+      <canvas id="mem"></canvas>
+      <canvas id="io"></canvas>
+    </section>
+    <section>
+      <h2>Collector latency</h2>
+      <canvas id="collect"></canvas>
+      <div class="muted" id="collectCaption"></div>
+    </section>
+    <section>
+      <h2>Hybrid search / discovery</h2>
+      <div class="search-row">
+        <input id="q" placeholder="search processes, hosts, connectors, audit…"/>
+        <select id="mode">
+          <option value="hybrid">hybrid</option>
+          <option value="fts">FTS</option>
+          <option value="vector">vector</option>
+        </select>
+        <button id="go">Search</button>
+      </div>
+      <canvas id="scores"></canvas>
+      <table id="hits"><thead><tr><th>kind</th><th>title</th><th>score</th></tr></thead><tbody></tbody></table>
+    </section>
+    <section>
+      <h2>Index mix</h2>
+      <canvas id="kinds"></canvas>
+      <div id="kindLegend" class="muted"></div>
+    </section>
+    <section>
+      <h2>Log volume by hour</h2>
+      <canvas id="hours"></canvas>
+    </section>
+    <section>
+      <h2>Recent logs</h2>
+      <table id="logs"><thead><tr><th>level</th><th>target</th><th>message</th></tr></thead><tbody></tbody></table>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function drawLine(canvas, points, color) {
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.clientWidth * dpr;
+      canvas.height = canvas.clientHeight * dpr;
+      ctx.scale(dpr, dpr);
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      ctx.clearRect(0,0,w,h);
+      ctx.strokeStyle = '#2d3e4e';
+      ctx.strokeRect(0.5,0.5,w-1,h-1);
+      if (!points || points.length < 2) return;
+      const ys = points.map(p => p[1]);
+      const min = Math.min(...ys), max = Math.max(...ys);
+      const span = Math.max(1e-6, max - min);
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.6;
+      points.forEach((p, i) => {
+        const x = (i / (points.length - 1)) * (w - 8) + 4;
+        const y = h - 6 - ((p[1] - min) / span) * (h - 12);
+        if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      });
+      ctx.stroke();
+    }
+    function drawBars(canvas, values, color) {
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.clientWidth * dpr;
+      canvas.height = canvas.clientHeight * dpr;
+      ctx.scale(dpr, dpr);
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      ctx.clearRect(0,0,w,h);
+      const max = Math.max(1, ...values);
+      const bw = w / values.length;
+      values.forEach((v, i) => {
+        const bh = (v / max) * (h - 8);
+        ctx.fillStyle = color;
+        ctx.fillRect(i * bw + 1, h - bh - 2, Math.max(1, bw - 2), bh);
+      });
+    }
+    async function j(path) {
+      const r = await fetch(path);
+      if (!r.ok) throw new Error(path);
+      return r.json();
+    }
+    async function refresh() {
+      const [health, series, logs, disc] = await Promise.all([
+        j('/health'), j('/api/metrics/series?limit=180'), j('/api/logs?limit=20'), j('/api/discover')
+      ]);
+      $('health').textContent = health.detail || JSON.stringify(health);
+      $('chips').innerHTML = [
+        ['cycles', health.cycles],
+        ['collect ms', (health.collect_last_ms||0).toFixed(1)],
+        ['errors', health.errors_total],
+        ['docs', health.documents],
+      ].map(([k,v]) => `<span class="chip">${k}: ${v}</span>`).join('');
+      drawLine($('cpu'), (series.cpu||[]).map(p => [p.ts, p.value]), '#60b0d2');
+      drawLine($('mem'), (series.mem||[]).map(p => [p.ts, p.value]), '#c49e42');
+      drawLine($('io'), (series.disk||[]).map(p => [p.ts, p.value]), '#82cdeb');
+      drawLine($('collect'), (series.collect_ms||[]).map(p => [p.ts, p.value]), '#b44242');
+      $('collectCaption').textContent = 'Source: local SQLite collect_samples';
+      drawBars($('hours'), disc.log_hour_bins || new Array(24).fill(0), '#60b0d2');
+      const kinds = disc.trending || [];
+      drawBars($('kinds'), kinds.map(k => k.count), '#c49e42');
+      $('kindLegend').textContent = kinds.map(k => `${k.kind}:${k.count}`).join(' · ');
+      $('logs').querySelector('tbody').innerHTML = (logs.entries||[]).map(l =>
+        `<tr><td>${l.level}</td><td>${l.target}</td><td>${(l.message||'').slice(0,120)}</td></tr>`
+      ).join('');
+    }
+    async function search() {
+      const q = encodeURIComponent($('q').value);
+      const mode = $('mode').value;
+      const data = await j(`/api/search?q=${q}&mode=${mode}&limit=12`);
+      const hits = data.hits || [];
+      $('hits').querySelector('tbody').innerHTML = hits.map(h =>
+        `<tr><td>${h.kind}</td><td>${h.title}</td><td>${(h.fused_score||0).toFixed(4)}</td></tr>`
+      ).join('');
+      drawBars($('scores'), hits.map(h => h.fused_score || 0), '#60b0d2');
+    }
+    $('go').onclick = search;
+    $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+    refresh(); search();
+    setInterval(refresh, 4000);
+  </script>
+</body>
+</html>

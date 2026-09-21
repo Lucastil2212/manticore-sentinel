@@ -1,3 +1,5 @@
+use std::thread;
+
 use crate::collectors::{
     cpu::CpuCollector, disk::DiskCollector, memory::MemoryCollector, network::NetworkCollector,
     process::ProcessCollector,
@@ -43,7 +45,7 @@ impl SentinelEngine {
         }
     }
 
-    pub async fn collect(&mut self) -> anyhow::Result<SystemSnapshot> {
+    pub fn collect_blocking(&mut self) -> anyhow::Result<SystemSnapshot> {
         let snapshots = self.collect_all()?;
         snapshots
             .get(self.primary_host_idx)
@@ -97,11 +99,30 @@ impl LocalHostCollector {
 impl HostCollector for LocalHostCollector {
     fn collect(&mut self) -> anyhow::Result<SystemSnapshot> {
         let timestamp = now_unix_secs();
-        let cpu = self.cpu.collect()?;
-        let memory = self.memory.collect()?;
-        let processes = self.process.collect()?;
-        let disks = self.disk.collect()?;
-        let network = self.network.collect()?;
+        let cpu = &mut self.cpu;
+        let memory = &mut self.memory;
+        let process = &mut self.process;
+        let disk = &mut self.disk;
+        let network = &mut self.network;
+        let (cpu, memory, processes, disks, network) = thread::scope(|s| {
+            let cpu_h = s.spawn(|| cpu.collect());
+            let memory_h = s.spawn(|| memory.collect());
+            let process_h = s.spawn(|| process.collect());
+            let disk_h = s.spawn(|| disk.collect());
+            let network_h = s.spawn(|| network.collect());
+            (
+                cpu_h.join(),
+                memory_h.join(),
+                process_h.join(),
+                disk_h.join(),
+                network_h.join(),
+            )
+        });
+        let cpu = cpu.map_err(|_| anyhow::anyhow!("cpu collector panicked"))??;
+        let memory = memory.map_err(|_| anyhow::anyhow!("memory collector panicked"))??;
+        let processes = processes.map_err(|_| anyhow::anyhow!("process collector panicked"))??;
+        let disks = disks.map_err(|_| anyhow::anyhow!("disk collector panicked"))??;
+        let network = network.map_err(|_| anyhow::anyhow!("network collector panicked"))??;
 
         Ok(SystemSnapshot {
             timestamp,

@@ -9,6 +9,7 @@ pub struct EvrusConnector {
     config: EvrusConfig,
     status: ConnectorStatus,
     oidc_healthy: bool,
+    client: Option<reqwest::blocking::Client>,
 }
 
 impl EvrusConnector {
@@ -17,19 +18,30 @@ impl EvrusConnector {
             config,
             status: ConnectorStatus::Connecting,
             oidc_healthy: false,
+            client: None,
         }
     }
 
-    fn probe_oidc(&self) -> Result<serde_json::Value, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("http client init: {e}"))?;
+    fn client(&mut self) -> Result<&reqwest::blocking::Client, String> {
+        if self.client.is_none() {
+            let built = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .pool_max_idle_per_host(2)
+                .build()
+                .map_err(|e| format!("http client init: {e}"))?;
+            self.client = Some(built);
+        }
+        self.client
+            .as_ref()
+            .ok_or_else(|| "http client missing".to_string())
+    }
 
+    fn probe_oidc(&mut self) -> Result<serde_json::Value, String> {
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             self.config.oidc_url.trim_end_matches('/')
         );
+        let client = self.client()?.clone();
 
         let resp = client
             .get(&discovery_url)

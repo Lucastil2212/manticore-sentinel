@@ -1,4 +1,5 @@
 use crate::security::auth::{AuthMode, Role, TokenLifecycle};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct PeerWeaveConfig {
@@ -49,6 +50,9 @@ pub struct RuntimeConfig {
     pub event_stream: Option<EventStreamConfig>,
     pub snapshot_history: SnapshotHistoryConfig,
     pub audit_retention: AuditRetentionConfig,
+    pub store: StoreConfig,
+    pub search: SearchConfig,
+    pub observability: ObservabilityConfig,
     pub config_warnings: Vec<ConfigWarning>,
 }
 
@@ -71,6 +75,24 @@ pub struct SnapshotHistoryConfig {
     pub max_bytes: Option<u64>,
     pub slim_records: bool,
     pub reset_on_start: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreConfig {
+    pub enabled: bool,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservabilityConfig {
+    pub http_enabled: bool,
+    pub http_port: u16,
+    pub log_json: bool,
 }
 
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
@@ -240,6 +262,26 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
             archive_enabled,
         }
     };
+    let store_enabled = parse_bool_env("MANTICORE_STORE_ENABLED", true).unwrap_or(true);
+    let store_path = std::env::var("MANTICORE_STORE_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".beads")
+                .join("state")
+                .join("sentinel.sqlite")
+        });
+    let search_enabled = parse_bool_env("MANTICORE_SEARCH_ENABLED", true).unwrap_or(true);
+    let obs_http_enabled =
+        parse_bool_env("MANTICORE_OBS_HTTP_ENABLED", false).unwrap_or(false);
+    let obs_http_port = std::env::var("MANTICORE_OBS_HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(9463);
+    let log_json = parse_bool_env("MANTICORE_LOG_JSON", false).unwrap_or(false);
 
     Ok(RuntimeConfig {
         profile,
@@ -256,6 +298,18 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         event_stream,
         snapshot_history,
         audit_retention,
+        store: StoreConfig {
+            enabled: store_enabled,
+            path: store_path,
+        },
+        search: SearchConfig {
+            enabled: search_enabled,
+        },
+        observability: ObservabilityConfig {
+            http_enabled: obs_http_enabled,
+            http_port: obs_http_port,
+            log_json,
+        },
         config_warnings: warnings,
     })
 }

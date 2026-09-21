@@ -3,8 +3,16 @@ mod collectors;
 mod connectors;
 mod core;
 mod models;
+mod observability;
+mod search;
 mod security;
+mod store;
+mod telemetry;
 mod utils;
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -14,7 +22,7 @@ fn main() -> anyhow::Result<()> {
         load_profile_env(&profile)?;
         tracing::info!(profile = %profile, "runtime profile loaded");
     }
-    let config = core::config::load_runtime_config()?;
+    let mut config = core::config::load_runtime_config()?;
     tracing::info!(
         profile = %config.profile,
         privileged = config.privileged,
@@ -22,15 +30,27 @@ fn main() -> anyhow::Result<()> {
         refresh_ms = config.refresh_ms,
         process_max_entries = config.process_max_entries,
         process_cmdline_entries = config.process_cmdline_entries,
+        store = %config.store.path.display(),
+        search = config.search.enabled,
+        obs_http = config.observability.http_enabled,
+        log_json = config.observability.log_json,
         "startup diagnostics"
     );
     if args.iter().any(|arg| arg == "--helper-daemon") {
         tracing::info!("starting helper daemon mode");
         return security::helper::run_helper_daemon_from_env();
     }
+    if args.iter().any(|arg| arg == "--healthcheck") {
+        return run_healthcheck(config.observability.http_port);
+    }
     if args.iter().any(|arg| arg == "--benchmark") {
         tracing::info!("starting benchmark mode");
         return run_benchmark_mode(&config);
+    }
+    if args.iter().any(|arg| arg == "--headless") {
+        config.observability.http_enabled = true;
+        tracing::info!("starting headless telemetry mode");
+        return run_headless(config);
     }
 
     let options = eframe::NativeOptions {
@@ -54,7 +74,17 @@ fn main() -> anyhow::Result<()> {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let json = std::env::var("MANTICORE_LOG_JSON")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if json {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    }
 }
 
 fn profile_arg(args: &[String]) -> Option<String> {
@@ -85,6 +115,73 @@ fn load_profile_env(profile: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_headless(config: core::config::RuntimeConfig) -> anyhow::Result<()> {
+    let telemetry = telemetry::TelemetryHandle::spawn(&config)?;
+    if config.observability.http_enabled {
+        observability::ObservabilityServer::spawn(config.observability.http_port, telemetry.clone())?;
+        tracing::info!(
+            port = config.observability.http_port,
+            "observability UI at / and /api/search"
+        );
+    }
+    if let Some(es) = config.event_stream.as_ref() {
+        match app::event_stream::EventStreamOutput::start(
+            es.port,
+            config.auth_mode,
+            config.auth_token.clone(),
+            config.connectors.evrus.as_ref().and_then(|ev| ev.jwt.clone()),
+        ) {
+            Ok(stream) => {
+                tracing::info!(port = es.port, "event stream listening");
+                loop {
+                    if let Some(tick) = telemetry.poll_tick() {
+                        let payload = serde_json::json!({
+                            "timestamp": tick.snapshot.timestamp,
+                            "host_id": tick.snapshot.host_id,
+                            "cpu_usage_percent": tick.snapshot.cpu.usage_percent,
+                            "memory_used": tick.snapshot.memory.used,
+                            "memory_total": tick.snapshot.memory.total,
+                            "process_count": tick.snapshot.processes.len(),
+                            "collect_ms": tick.collect_last_ms,
+                        });
+                        stream.emit_json("system_snapshot", &payload);
+                    }
+                    std::thread::sleep(Duration::from_millis(config.refresh_ms.max(200)));
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "event stream failed to bind; continuing without SSE");
+            }
+        }
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let (last, avg, cycles, polls, errors) = telemetry.stats_snapshot();
+        tracing::info!(
+            collect_last_ms = last,
+            collect_avg_ms = avg,
+            cycles,
+            connector_polls = polls,
+            errors_total = errors,
+            "headless heartbeat"
+        );
+    }
+}
+
+fn run_healthcheck(port: u16) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| anyhow::anyhow!("healthcheck connect {port}: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf)?;
+    if buf.contains("\"ok\":true") || buf.contains("HTTP/1.1 200") {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("healthcheck failed: {buf}"))
+    }
+}
+
 fn run_benchmark_mode(config: &core::config::RuntimeConfig) -> anyhow::Result<()> {
     use std::time::Instant;
 
@@ -93,17 +190,16 @@ fn run_benchmark_mode(config: &core::config::RuntimeConfig) -> anyhow::Result<()
         config.process_cmdline_entries,
     );
     engine.init_connectors(&config.connectors);
-    let runtime = tokio::runtime::Runtime::new()?;
     let iterations = 40u32;
 
     let startup_begin = Instant::now();
-    let _first = runtime.block_on(engine.collect())?;
+    let _first = engine.collect_blocking()?;
     let startup_ms = startup_begin.elapsed().as_secs_f64() * 1000.0;
 
     let mut total_ms = 0.0f64;
     for _ in 0..iterations {
         let step = Instant::now();
-        let _ = runtime.block_on(engine.collect())?;
+        let _ = engine.collect_blocking()?;
         if engine.has_connectors() {
             let _ = engine.poll_connectors();
         }

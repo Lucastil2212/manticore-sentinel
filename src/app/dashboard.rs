@@ -5,14 +5,12 @@ use base64::Engine;
 use eframe::egui;
 use egui::{FontFamily, FontId, RichText, Stroke};
 use egui_extras::install_image_loaders;
-use tokio::runtime::Runtime;
 
 use crate::connectors::ConnectorSummary;
 use crate::core::config::{AuditRetentionConfig, ConfigWarning};
 use crate::core::{
     command::{parse_command, CommandAction},
     config::load_runtime_config,
-    engine::SentinelEngine,
     history::{
         append_snapshot, count_since, default_snapshot_history_path,
         reset as reset_snapshot_history, SnapshotHistoryRetention,
@@ -20,6 +18,8 @@ use crate::core::{
     policy::{AlertMatch, AlertSeverity, ExecutionPolicy},
     snapshot::SystemSnapshot,
 };
+use crate::search::{discover, hybrid_search, DiscoveryReport, SearchHit, SearchMode};
+use crate::telemetry::TelemetryHandle;
 use crate::models::process::ProcessMetrics;
 use crate::security::audit::{
     anchor_audit_if_due, append_event_with_retention, audit_archive_stats, audit_entry_count,
@@ -29,7 +29,6 @@ use crate::security::audit::{
 use crate::security::auth::{AuthContext, AuthGate, AuthMode, TokenLifecycle};
 use crate::security::helper::{send_request, Capability, HelperRequest, HelperRuntime};
 use crate::utils::time::now_unix_secs;
-use tracing::error;
 
 use super::event_stream::EventStreamOutput;
 use super::icons;
@@ -42,6 +41,8 @@ const SECTION_CONTROL: &str = "control_activity";
 const SECTION_PROCESSES: &str = "processes";
 const SECTION_AUDIT: &str = "audit";
 const SECTION_CONNECTORS: &str = "connectors";
+const SECTION_SEARCH: &str = "search";
+const SECTION_OBSERVE: &str = "observe";
 const METRIC_HISTORY_CAP: usize = 360;
 
 #[derive(Clone)]
@@ -101,8 +102,7 @@ fn run_scoped_snapshot_history_path(root: &std::path::Path) -> std::path::PathBu
 }
 
 pub struct SentinelDashboard {
-    engine: SentinelEngine,
-    runtime: Runtime,
+    telemetry: TelemetryHandle,
     latest: Option<SystemSnapshot>,
     last_poll: Instant,
     poll_interval: Duration,
@@ -191,6 +191,12 @@ pub struct SentinelDashboard {
     audit_rate_history: VecDeque<(u64, usize, usize)>,
     connector_latency_history: VecDeque<(u64, Option<f64>, Option<f64>)>,
     previous_process_ids: HashSet<u32>,
+    search_query: String,
+    search_mode: SearchMode,
+    search_hits: Vec<SearchHit>,
+    discovery: Option<DiscoveryReport>,
+    last_search_query: String,
+    last_search_at: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +208,39 @@ enum ProcessSort {
 }
 
 impl SentinelDashboard {
+    fn hydrate_metric_history_from_store(&mut self) {
+        let Some(store) = self.telemetry.store() else {
+            return;
+        };
+        let Ok(rows) = store.recent_metrics(METRIC_HISTORY_CAP) else {
+            return;
+        };
+        for row in rows {
+            let mem_pct = if row.mem_total == 0 {
+                0.0
+            } else {
+                (row.mem_used as f32 / row.mem_total as f32) * 100.0
+            };
+            push_history(
+                &mut self.metric_history,
+                MetricSample {
+                    ts: row.ts,
+                    cpu_pct: row.cpu,
+                    mem_pct,
+                    disk_bps: row.disk_bps as f64,
+                    net_bps: row.net_bps as f64,
+                    process_count: row.process_count,
+                },
+                METRIC_HISTORY_CAP,
+            );
+            push_history(
+                &mut self.process_count_history,
+                (row.ts, row.process_count),
+                METRIC_HISTORY_CAP,
+            );
+        }
+    }
+
     fn hydrate_metric_history_from_disk(&mut self) {
         let raw = match std::fs::read_to_string(&self.snapshot_history_path) {
             Ok(v) => v,
@@ -433,9 +472,27 @@ impl SentinelDashboard {
             }
         }
 
-        let mut engine = SentinelEngine::new(cfg.process_max_entries, cfg.process_cmdline_entries);
-        engine.init_connectors(&cfg.connectors);
-        runtime_diagnostics = format!("{runtime_diagnostics} hosts={}", engine.host_count());
+        let telemetry = TelemetryHandle::spawn(&cfg)?;
+        runtime_diagnostics = format!(
+            "{runtime_diagnostics} store={} search={} obs_http={}",
+            if cfg.store.enabled { "on" } else { "off" },
+            if cfg.search.enabled { "on" } else { "off" },
+            if cfg.observability.http_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        if cfg.observability.http_enabled {
+            let _ = crate::observability::ObservabilityServer::spawn(
+                cfg.observability.http_port,
+                telemetry.clone(),
+            );
+            runtime_diagnostics = format!(
+                "{runtime_diagnostics} obs_port={}",
+                cfg.observability.http_port
+            );
+        }
         let connector_poll_interval = cfg
             .connectors
             .peerweave
@@ -466,8 +523,7 @@ impl SentinelDashboard {
         let ui_repaint_interval = Duration::from_millis(cfg.refresh_ms.clamp(250, 1500));
 
         let mut dashboard = Self {
-            engine,
-            runtime: Runtime::new()?,
+            telemetry,
             latest: None,
             last_poll: Instant::now() - poll_interval,
             poll_interval,
@@ -504,6 +560,8 @@ impl SentinelDashboard {
                 s.insert(SECTION_DISK_NET);
                 s.insert(SECTION_AUDIT);
                 s.insert(SECTION_CONNECTORS);
+                s.insert(SECTION_SEARCH);
+                s.insert(SECTION_OBSERVE);
                 s
             },
             scroll_to_section: None,
@@ -558,142 +616,26 @@ impl SentinelDashboard {
             audit_rate_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
             connector_latency_history: VecDeque::with_capacity(METRIC_HISTORY_CAP),
             previous_process_ids: HashSet::new(),
+            search_query: String::new(),
+            search_mode: SearchMode::Hybrid,
+            search_hits: Vec::new(),
+            discovery: None,
+            last_search_query: String::new(),
+            last_search_at: Instant::now() - Duration::from_secs(2),
         };
+        dashboard.hydrate_metric_history_from_store();
         dashboard.hydrate_metric_history_from_disk();
         Ok(dashboard)
     }
 
     fn poll(&mut self) {
+        self.drain_telemetry();
+        self.refresh_search_if_needed();
+
         if self.last_poll.elapsed() < self.poll_interval {
             return;
         }
         self.last_poll = Instant::now();
-
-        let collect_started = Instant::now();
-        match self.runtime.block_on(self.engine.collect()) {
-            Ok(snapshot) => {
-                self.self_collect_last_ms = collect_started.elapsed().as_secs_f64() * 1000.0;
-                self.self_collect_cycles = self.self_collect_cycles.saturating_add(1);
-                if self.self_collect_cycles == 1 {
-                    self.self_collect_avg_ms = self.self_collect_last_ms;
-                } else {
-                    self.self_collect_avg_ms =
-                        (self.self_collect_avg_ms * 0.9) + (self.self_collect_last_ms * 0.1);
-                }
-                self.engine.ingest_system_snapshot(&snapshot);
-                let mem_pct = if snapshot.memory.total == 0 {
-                    0.0
-                } else {
-                    (snapshot.memory.used as f32 / snapshot.memory.total as f32) * 100.0
-                };
-                let disk_bps: f64 = snapshot
-                    .disks
-                    .iter()
-                    .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec) as f64)
-                    .sum();
-                let net_bps: f64 = snapshot
-                    .network
-                    .iter()
-                    .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec) as f64)
-                    .sum();
-                if self.self_collect_cycles > 1 {
-                    push_history(
-                        &mut self.metric_history,
-                        MetricSample {
-                            ts: snapshot.timestamp,
-                            cpu_pct: snapshot.cpu.usage_percent,
-                            mem_pct,
-                            disk_bps,
-                            net_bps,
-                            process_count: snapshot.processes.len(),
-                        },
-                        METRIC_HISTORY_CAP,
-                    );
-                }
-                push_history(
-                    &mut self.process_count_history,
-                    (snapshot.timestamp, snapshot.processes.len()),
-                    METRIC_HISTORY_CAP,
-                );
-                let current_ids: HashSet<u32> = snapshot.processes.iter().map(|p| p.pid).collect();
-                if !self.previous_process_ids.is_empty() {
-                    let started = current_ids
-                        .difference(&self.previous_process_ids)
-                        .count();
-                    let exited = self
-                        .previous_process_ids
-                        .difference(&current_ids)
-                        .count();
-                    push_history(
-                        &mut self.process_churn_history,
-                        (snapshot.timestamp, started, exited),
-                        METRIC_HISTORY_CAP,
-                    );
-                }
-                self.previous_process_ids = current_ids;
-                if self.snapshot_history_enabled {
-                    if let Err(err) = append_snapshot(
-                        &self.snapshot_history_path,
-                        &snapshot,
-                        SnapshotHistoryRetention {
-                            max_entries: self.snapshot_history_max_entries,
-                            max_age_secs: self.snapshot_history_max_age_secs,
-                            max_bytes: self.snapshot_history_max_bytes,
-                            slim_records: self.snapshot_history_slim_records,
-                        },
-                    ) {
-                        self.last_error = Some(format!("snapshot persistence failed: {err}"));
-                        self.self_errors_total = self.self_errors_total.saturating_add(1);
-                        self.self_last_error_ts = Some(now_unix_secs());
-                    }
-                }
-                self.latest_alerts = self.policy.evaluate_snapshot_alerts(&snapshot);
-                if let Some(stream) = &self.event_stream {
-                    let payload = serde_json::json!({
-                        "timestamp": snapshot.timestamp,
-                        "host_id": snapshot.host_id,
-                        "cpu_usage_percent": snapshot.cpu.usage_percent,
-                        "load_avg": [snapshot.cpu.load_avg.0, snapshot.cpu.load_avg.1, snapshot.cpu.load_avg.2],
-                        "memory_used": snapshot.memory.used,
-                        "memory_total": snapshot.memory.total,
-                        "disk_count": snapshot.disks.len(),
-                        "network_count": snapshot.network.len(),
-                        "process_count": snapshot.processes.len(),
-                    });
-                    stream.emit_json("system_snapshot", &payload);
-                }
-                self.latest = Some(snapshot);
-                self.last_error = None;
-            }
-            Err(err) => {
-                self.last_error = Some(err.to_string());
-                error!(category = "collector", message = %err, "snapshot collection failed");
-                self.self_errors_total = self.self_errors_total.saturating_add(1);
-                self.self_last_error_ts = Some(now_unix_secs());
-            }
-        }
-
-        if self.engine.has_connectors()
-            && self.last_connector_poll.elapsed() >= self.connector_poll_interval
-        {
-            self.connector_summary = self.engine.poll_connectors();
-            let now = now_unix_secs();
-            let pw = self
-                .connector_summary
-                .health_for("PeerWeave")
-                .and_then(|h| h.latency_ms);
-            let evrus = self
-                .connector_summary
-                .health_for("EVRUS")
-                .and_then(|h| h.latency_ms);
-            push_history(
-                &mut self.connector_latency_history,
-                (now, pw, evrus),
-                METRIC_HISTORY_CAP,
-            );
-            self.self_connector_polls = self.self_connector_polls.saturating_add(1);
-            self.last_connector_poll = Instant::now();
-        }
 
         if let Some(anchor_cfg) = &self.evrus_anchor_config {
             if self.last_anchor_poll.elapsed() >= self.anchor_interval {
@@ -738,17 +680,21 @@ impl SentinelDashboard {
             self.last_event_stream_audit_poll = Instant::now();
         }
 
-        if self.snapshot_history_enabled
-            && self.last_snapshot_history_probe.elapsed() >= Duration::from_secs(30)
-        {
+        if self.last_snapshot_history_probe.elapsed() >= Duration::from_secs(30) {
             let now = now_unix_secs();
             let min_ts = now.saturating_sub(3600);
-            match count_since(&self.snapshot_history_path, min_ts) {
-                Ok(count) => self.snapshot_history_recent_hour = count,
-                Err(err) => {
-                    self.last_error = Some(format!("snapshot history query failed: {err}"));
-                    self.self_errors_total = self.self_errors_total.saturating_add(1);
-                    self.self_last_error_ts = Some(now_unix_secs());
+            if let Some(store) = self.telemetry.store() {
+                if let Ok(count) = store.metric_count_since(min_ts) {
+                    self.snapshot_history_recent_hour = count;
+                }
+            } else if self.snapshot_history_enabled {
+                match count_since(&self.snapshot_history_path, min_ts) {
+                    Ok(count) => self.snapshot_history_recent_hour = count,
+                    Err(err) => {
+                        self.last_error = Some(format!("snapshot history query failed: {err}"));
+                        self.self_errors_total = self.self_errors_total.saturating_add(1);
+                        self.self_last_error_ts = Some(now_unix_secs());
+                    }
                 }
             }
             self.last_snapshot_history_probe = Instant::now();
@@ -765,6 +711,152 @@ impl SentinelDashboard {
             (now_unix_secs(), allow_count, deny_count),
             METRIC_HISTORY_CAP,
         );
+    }
+
+    fn drain_telemetry(&mut self) {
+        let Some(tick) = self.telemetry.poll_tick() else {
+            let summary = self.telemetry.connectors();
+            if !summary.entries.is_empty() {
+                self.connector_summary = summary;
+            }
+            return;
+        };
+        let snapshot = (*tick.snapshot).clone();
+        self.self_collect_last_ms = tick.collect_last_ms;
+        self.self_collect_avg_ms = tick.collect_avg_ms;
+        self.self_collect_cycles = tick.collect_cycles;
+        self.self_connector_polls = tick.connector_polls;
+        self.self_errors_total = tick.errors_total;
+        self.self_last_error_ts = tick.last_error_ts;
+        if let Some(err) = tick.last_error {
+            self.last_error = Some(err);
+        } else {
+            self.last_error = None;
+        }
+        if tick.connector_polls > 0 || !tick.connectors.entries.is_empty() {
+            let now = now_unix_secs();
+            let pw = tick
+                .connectors
+                .health_for("PeerWeave")
+                .and_then(|h| h.latency_ms);
+            let evrus = tick.connectors.health_for("EVRUS").and_then(|h| h.latency_ms);
+            if self.last_connector_poll.elapsed() >= self.connector_poll_interval
+                || self.connector_summary.entries.is_empty()
+            {
+                push_history(
+                    &mut self.connector_latency_history,
+                    (now, pw, evrus),
+                    METRIC_HISTORY_CAP,
+                );
+                self.last_connector_poll = Instant::now();
+            }
+            self.connector_summary = tick.connectors;
+        }
+
+        let mem_pct = if snapshot.memory.total == 0 {
+            0.0
+        } else {
+            (snapshot.memory.used as f32 / snapshot.memory.total as f32) * 100.0
+        };
+        let disk_bps: f64 = snapshot
+            .disks
+            .iter()
+            .map(|d| d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec) as f64)
+            .sum();
+        let net_bps: f64 = snapshot
+            .network
+            .iter()
+            .map(|n| n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec) as f64)
+            .sum();
+        if self.self_collect_cycles > 1 {
+            push_history(
+                &mut self.metric_history,
+                MetricSample {
+                    ts: snapshot.timestamp,
+                    cpu_pct: snapshot.cpu.usage_percent,
+                    mem_pct,
+                    disk_bps,
+                    net_bps,
+                    process_count: snapshot.processes.len(),
+                },
+                METRIC_HISTORY_CAP,
+            );
+        }
+        push_history(
+            &mut self.process_count_history,
+            (snapshot.timestamp, snapshot.processes.len()),
+            METRIC_HISTORY_CAP,
+        );
+        let current_ids: HashSet<u32> = snapshot.processes.iter().map(|p| p.pid).collect();
+        if !self.previous_process_ids.is_empty() {
+            let started = current_ids.difference(&self.previous_process_ids).count();
+            let exited = self.previous_process_ids.difference(&current_ids).count();
+            push_history(
+                &mut self.process_churn_history,
+                (snapshot.timestamp, started, exited),
+                METRIC_HISTORY_CAP,
+            );
+        }
+        self.previous_process_ids = current_ids;
+        if self.snapshot_history_enabled {
+            if let Err(err) = append_snapshot(
+                &self.snapshot_history_path,
+                &snapshot,
+                SnapshotHistoryRetention {
+                    max_entries: self.snapshot_history_max_entries,
+                    max_age_secs: self.snapshot_history_max_age_secs,
+                    max_bytes: self.snapshot_history_max_bytes,
+                    slim_records: self.snapshot_history_slim_records,
+                },
+            ) {
+                self.last_error = Some(format!("snapshot persistence failed: {err}"));
+                self.self_errors_total = self.self_errors_total.saturating_add(1);
+                self.self_last_error_ts = Some(now_unix_secs());
+            }
+        }
+        self.latest_alerts = self.policy.evaluate_snapshot_alerts(&snapshot);
+        if let Some(stream) = &self.event_stream {
+            let payload = serde_json::json!({
+                "timestamp": snapshot.timestamp,
+                "host_id": snapshot.host_id,
+                "cpu_usage_percent": snapshot.cpu.usage_percent,
+                "load_avg": [snapshot.cpu.load_avg.0, snapshot.cpu.load_avg.1, snapshot.cpu.load_avg.2],
+                "memory_used": snapshot.memory.used,
+                "memory_total": snapshot.memory.total,
+                "disk_count": snapshot.disks.len(),
+                "network_count": snapshot.network.len(),
+                "process_count": snapshot.processes.len(),
+            });
+            stream.emit_json("system_snapshot", &payload);
+        }
+        self.latest = Some(snapshot);
+    }
+
+    fn refresh_search_if_needed(&mut self) {
+        if self.last_search_at.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        if self.search_query == self.last_search_query && !self.search_hits.is_empty() {
+            return;
+        }
+        self.run_search();
+    }
+
+    fn run_search(&mut self) {
+        self.last_search_at = Instant::now();
+        self.last_search_query = self.search_query.clone();
+        let Some(store) = self.telemetry.store() else {
+            self.search_hits.clear();
+            self.discovery = None;
+            return;
+        };
+        let query = self.search_query.clone();
+        let mode = self.search_mode;
+        self.search_hits = hybrid_search(store, &query, mode, 16).unwrap_or_default();
+        self.discovery = discover(store, &query, 12).ok();
+        if !query.trim().is_empty() {
+            store.write_log("info", "search", &format!("query={query} mode={}", mode.as_str()));
+        }
     }
 
     fn verify_auth_submission(&mut self, action: &CommandAction) -> Result<(), String> {
@@ -839,7 +931,7 @@ impl SentinelDashboard {
         }
     }
 
-    fn execute_read_only_command(&self, action: &CommandAction) -> Option<String> {
+    fn execute_read_only_command(&mut self, action: &CommandAction) -> Option<String> {
         match action {
             CommandAction::ShowCpu => {
                 let snap = self.latest.as_ref()?;
@@ -1013,7 +1105,7 @@ impl SentinelDashboard {
             }
             CommandAction::ShowConnectors => {
                 let summary = if self.connector_summary.entries.is_empty() {
-                    self.engine.connector_summary_passive()
+                    self.telemetry.connectors()
                 } else {
                     self.connector_summary.clone()
                 };
@@ -1058,6 +1150,18 @@ impl SentinelDashboard {
                     .unwrap_or(0);
                 let (arc_count, arc_bytes) = audit_archive_stats(&audit_path);
                 let mut out = String::from("Storage health:\n");
+                if let Some(store) = self.telemetry.store() {
+                    if let Ok(stats) = store.stats() {
+                        out.push_str(&format!(
+                            "  sqlite:         {} metrics, {} docs, {} logs, {}\n",
+                            stats.metrics,
+                            stats.documents,
+                            stats.logs,
+                            format_bytes(stats.bytes)
+                        ));
+                        out.push_str(&format!("  sqlite path:    {}\n", stats.path.display()));
+                    }
+                }
                 out.push_str(&format!(
                     "  audit events:   {} entries, {}\n",
                     entries,
@@ -1089,6 +1193,60 @@ impl SentinelDashboard {
                         .map(format_bytes)
                         .unwrap_or_else(|| "off".to_string())
                 ));
+                Some(out)
+            }
+            CommandAction::Search { query, mode } => {
+                if let Some(mode) = mode {
+                    self.search_mode = SearchMode::from_env(mode);
+                }
+                if !query.is_empty() {
+                    self.search_query = query.clone();
+                }
+                self.run_search();
+                self.collapsed_sections.remove(SECTION_SEARCH);
+                self.scroll_to_section = Some(SECTION_SEARCH);
+                if self.search_hits.is_empty() {
+                    Some(format!(
+                        "No search hits for '{}'. Index fills as telemetry arrives.",
+                        self.search_query
+                    ))
+                } else {
+                    let mut out = format!(
+                        "Search [{}] {} hits:\n",
+                        self.search_mode.as_str(),
+                        self.search_hits.len()
+                    );
+                    for hit in self.search_hits.iter().take(12) {
+                        out.push_str(&format!(
+                            "  [{:.4}] {} · {} — {}\n",
+                            hit.fused_score,
+                            hit.kind,
+                            hit.title,
+                            hit.body.chars().take(80).collect::<String>()
+                        ));
+                    }
+                    Some(out)
+                }
+            }
+            CommandAction::ShowObservability => {
+                self.collapsed_sections.remove(SECTION_OBSERVE);
+                self.scroll_to_section = Some(SECTION_OBSERVE);
+                let mut out = format!(
+                    "Observability:\n  collect_last_ms={:.3}\n  collect_avg_ms={:.3}\n  cycles={}\n  connector_polls={}\n  errors={}\n",
+                    self.self_collect_last_ms,
+                    self.self_collect_avg_ms,
+                    self.self_collect_cycles,
+                    self.self_connector_polls,
+                    self.self_errors_total
+                );
+                if let Some(store) = self.telemetry.store() {
+                    if let Ok(stats) = store.stats() {
+                        out.push_str(&format!(
+                            "  store metrics={} docs={} logs={} embeddings={}\n",
+                            stats.metrics, stats.documents, stats.logs, stats.embeddings
+                        ));
+                    }
+                }
                 Some(out)
             }
             CommandAction::Help { topic } => {
@@ -1881,8 +2039,7 @@ impl SentinelDashboard {
         if let Some(health) = self.connector_summary.health_for(name) {
             return Some(health.clone());
         }
-        let passive = self.engine.connector_summary_passive();
-        passive.health_for(name).cloned()
+        self.telemetry.connectors().health_for(name).cloned()
     }
 
     fn render_unified_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2043,6 +2200,28 @@ impl SentinelDashboard {
             "Ecosystem Connectors",
         ) {
             self.render_connectors_section(ui);
+        }
+        ui.separator();
+
+        if self.section_header(
+            ui,
+            SECTION_SEARCH,
+            "search-discover",
+            icons::RADAR,
+            "Search & Discovery",
+        ) {
+            self.render_search_section(ui);
+        }
+        ui.separator();
+
+        if self.section_header(
+            ui,
+            SECTION_OBSERVE,
+            "observe-logs",
+            icons::SETTINGS,
+            "Observability",
+        ) {
+            self.render_observability_section(ui);
         }
     }
 
@@ -2578,7 +2757,7 @@ impl SentinelDashboard {
         });
 
         if self.connector_summary.entries.is_empty() {
-            let passive = self.engine.connector_summary_passive();
+            let passive = self.telemetry.connectors();
             if passive.entries.is_empty() {
                 ui.label("No connectors configured.");
                 ui.monospace(
@@ -2792,6 +2971,193 @@ impl SentinelDashboard {
             format_bytes(snapshot_size),
             self.snapshot_history_max_entries
         ));
+        if let Some(store) = self.telemetry.store() {
+            if let Ok(stats) = store.stats() {
+                ui.monospace(format!(
+                    "sqlite: {} metrics · {} docs · {} embeddings · {}",
+                    stats.metrics,
+                    stats.documents,
+                    stats.embeddings,
+                    format_bytes(stats.bytes)
+                ));
+            }
+        }
+    }
+
+    fn render_search_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Hybrid FTS + hashed n-gram vectors over host, process, connector, and log documents.")
+                .weak(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Query");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .desired_width(260.0)
+                    .hint_text("nginx, high cpu, PeerWeave…"),
+            );
+            if resp.changed() {
+                self.last_search_at = Instant::now() - Duration::from_millis(200);
+            }
+            ui.selectable_value(&mut self.search_mode, SearchMode::Hybrid, "hybrid");
+            ui.selectable_value(&mut self.search_mode, SearchMode::Fts, "FTS");
+            ui.selectable_value(&mut self.search_mode, SearchMode::Vector, "vector");
+            if ui.small_button("Search").clicked() {
+                self.run_search();
+            }
+        });
+        ui.add_space(6.0);
+
+        let score_bars: Vec<(String, f64)> = self
+            .search_hits
+            .iter()
+            .take(8)
+            .map(|h| (format!("{}:{}", h.kind, h.title), h.fused_score as f64))
+            .collect();
+        render_horizontal_bar_chart(
+            ui,
+            "Fused ranking",
+            &score_bars,
+            egui::Color32::from_rgb(96, 176, 210),
+            |v| format!("{v:.3}"),
+        );
+        let vector_vals: Vec<f64> = self
+            .search_hits
+            .iter()
+            .filter_map(|h| h.vector_score.map(|v| v as f64))
+            .collect();
+        render_distribution_bins(ui, "Vector cosine distribution", &vector_vals, 8);
+
+        if let Some(disc) = &self.discovery {
+            let kinds: Vec<(String, f64)> = disc
+                .trending
+                .iter()
+                .map(|(k, c)| (k.clone(), *c as f64))
+                .collect();
+            render_horizontal_bar_chart(
+                ui,
+                "Indexed kinds",
+                &kinds,
+                egui::Color32::from_rgb(196, 158, 66),
+                |v| format!("{v:.0}"),
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("Hits").strong());
+        if self.search_hits.is_empty() {
+            ui.label(
+                RichText::new("Waiting for indexed telemetry. Host snapshots land every cycle.")
+                    .weak(),
+            );
+        } else {
+            for hit in self.search_hits.iter().take(12) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(format!("{:<10}", hit.kind));
+                    ui.label(RichText::new(&hit.title).strong());
+                    ui.label(
+                        RichText::new(format!(
+                            "rrf {:.3}  vec {}",
+                            hit.fused_score,
+                            hit.vector_score
+                                .map(|v| format!("{v:.2}"))
+                                .unwrap_or_else(|| "-".into())
+                        ))
+                        .weak(),
+                    );
+                });
+                ui.label(
+                    RichText::new(hit.body.chars().take(140).collect::<String>()).small(),
+                );
+            }
+        }
+    }
+
+    fn render_observability_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Collector latency, store occupancy, and log analytics for this node.")
+                .weak(),
+        );
+        ui.monospace(format!(
+            "collect_last_ms={:.3} collect_avg_ms={:.3} cycles={} errors={}",
+            self.self_collect_last_ms,
+            self.self_collect_avg_ms,
+            self.self_collect_cycles,
+            self.self_errors_total
+        ));
+        let collect_points: Vec<(u64, f64)> = self
+            .telemetry
+            .store()
+            .and_then(|s| s.collect_samples(METRIC_HISTORY_CAP).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(ts, ms, _)| (ts, ms))
+            .collect();
+        render_line_chart(
+            ui,
+            "Collect latency",
+            &collect_points,
+            egui::Color32::from_rgb(180, 66, 66),
+            80.0,
+            |v| format!("{v:.1}ms"),
+        );
+        let collect_vals: Vec<f64> = collect_points.iter().map(|p| p.1).collect();
+        render_distribution_bins(ui, "Collect latency histogram", &collect_vals, 10);
+
+        let cpu_points: Vec<(u64, f64)> = self
+            .metric_history
+            .iter()
+            .map(|s| (s.ts, s.cpu_pct as f64))
+            .collect();
+        let mem_points: Vec<(u64, f64)> = self
+            .metric_history
+            .iter()
+            .map(|s| (s.ts, s.mem_pct as f64))
+            .collect();
+        render_line_chart(
+            ui,
+            "CPU (indexed window)",
+            &cpu_points,
+            egui::Color32::from_rgb(96, 176, 210),
+            70.0,
+            |v| format!("{v:.1}%"),
+        );
+        render_line_chart(
+            ui,
+            "Memory (indexed window)",
+            &mem_points,
+            egui::Color32::from_rgb(196, 158, 66),
+            70.0,
+            |v| format!("{v:.1}%"),
+        );
+
+        let mut hour_bins = [0usize; 24];
+        if let Some(store) = self.telemetry.store() {
+            if let Ok(bins) = store.log_hour_bins() {
+                hour_bins = bins;
+            }
+        }
+        render_hour_heatmap(ui, "Log volume by hour (UTC remainder)", &hour_bins);
+
+        let logs = self
+            .telemetry
+            .store()
+            .and_then(|s| s.recent_logs(8).ok())
+            .unwrap_or_default();
+        if !logs.is_empty() {
+            ui.label(RichText::new("Recent logs").strong());
+            for log in logs.iter().rev().take(8) {
+                ui.monospace(format!(
+                    "{} {:<7} {:<16} {}",
+                    log.ts,
+                    log.level,
+                    log.target.chars().take(16).collect::<String>(),
+                    log.message.chars().take(90).collect::<String>()
+                ));
+            }
+        }
     }
 
     fn fill_vertical_remainder(&self, ui: &mut egui::Ui) {
@@ -2807,9 +3173,9 @@ impl eframe::App for SentinelDashboard {
         if !self.visuals_applied {
             install_image_loaders(ctx);
             apply_security_visuals(ctx);
+            suppress_debug_overlays(ctx);
             self.visuals_applied = true;
         }
-        suppress_debug_overlays(ctx);
         self.poll();
         self.handle_global_shortcuts(ctx);
         ctx.request_repaint_after(self.ui_repaint_interval);
@@ -3936,6 +4302,24 @@ fn push_history<T>(buf: &mut VecDeque<T>, value: T, cap: usize) {
     buf.push_back(value);
 }
 
+fn downsample_points(points: &[(u64, f64)], max_points: usize) -> Vec<(u64, f64)> {
+    if points.len() <= max_points {
+        return points.to_vec();
+    }
+    let stride = points.len() / max_points;
+    let mut out: Vec<(u64, f64)> = points
+        .iter()
+        .step_by(stride.max(1))
+        .copied()
+        .collect();
+    if let Some(last) = points.last() {
+        if out.last() != Some(last) {
+            out.push(*last);
+        }
+    }
+    out
+}
+
 fn render_line_chart<F: Fn(f64) -> String>(
     ui: &mut egui::Ui,
     title: &str,
@@ -3949,6 +4333,8 @@ fn render_line_chart<F: Fn(f64) -> String>(
         ui.label(RichText::new("Waiting for more samples...").weak());
         return;
     }
+    let points = downsample_points(points, 180);
+    let points = points.as_slice();
     let width = ui.available_width().max(140.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let min_x = points.iter().map(|p| p.0).min().unwrap_or(0) as f64;
@@ -4230,6 +4616,7 @@ fn human_bytes(bytes: u64) -> String {
 /// The style-level debug flags are a separate layer on top.
 fn suppress_debug_overlays(ctx: &egui::Context) {
     ctx.options_mut(|opt| opt.warn_on_id_clash = false);
+    #[cfg(debug_assertions)]
     ctx.style_mut(|style| {
         style.debug.debug_on_hover = false;
         style.debug.debug_on_hover_with_all_modifiers = false;

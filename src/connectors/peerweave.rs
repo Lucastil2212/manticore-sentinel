@@ -17,6 +17,7 @@ pub struct PeerWeaveConnector {
     last_publish_at: Option<Instant>,
     host_id: String,
     trust_mode: String,
+    client: Option<reqwest::blocking::Client>,
 }
 
 impl PeerWeaveConnector {
@@ -35,14 +36,22 @@ impl PeerWeaveConnector {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "local".to_string()),
+            client: None,
         }
     }
 
-    fn build_client(&self) -> Result<reqwest::blocking::Client, String> {
-        reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("http client init: {e}"))
+    fn client(&mut self) -> Result<&reqwest::blocking::Client, String> {
+        if self.client.is_none() {
+            let built = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .pool_max_idle_per_host(2)
+                .build()
+                .map_err(|e| format!("http client init: {e}"))?;
+            self.client = Some(built);
+        }
+        self.client
+            .as_ref()
+            .ok_or_else(|| "http client missing".to_string())
     }
 
     fn with_auth(
@@ -56,15 +65,16 @@ impl PeerWeaveConnector {
         }
     }
 
-    fn query_health(&self) -> Result<serde_json::Value, String> {
-        let client = self.build_client()?;
+    fn query_health(&mut self) -> Result<serde_json::Value, String> {
+        let url = self.config.graphql_url.clone();
+        let client = self.client()?.clone();
 
         let query = json!({
             "query": "{ node { peerId status uptime peers { count } } spaces { id name syncState } graph { nodeCount edgeCount } }"
         });
 
         let req = client
-            .post(&self.config.graphql_url)
+            .post(&url)
             .header("Content-Type", "application/json")
             .json(&query);
         let req = self.with_auth(req);
@@ -89,7 +99,7 @@ impl PeerWeaveConnector {
     }
 
     fn publish_snapshot(&mut self) -> Result<(), String> {
-        let Some(space_id) = self.config.publish_space_id.as_deref() else {
+        let Some(space_id) = self.config.publish_space_id.clone() else {
             return Err(
                 "publish enabled but MANTICORE_PEERWEAVE_PUBLISH_SPACE_ID is not set".to_string(),
             );
@@ -98,17 +108,19 @@ impl PeerWeaveConnector {
             return Ok(());
         };
 
-        let client = self.build_client()?;
+        let url = self.config.graphql_url.clone();
+        let host_id = self.host_id.clone();
+        let client = self.client()?.clone();
         let body = json!({
             "query": "mutation SentinelIngestSnapshot($spaceId: String!, $host: String!, $snapshot: JSON!) { sentinelIngestSnapshot(spaceId: $spaceId, host: $host, snapshot: $snapshot) { accepted } }",
             "variables": {
                 "spaceId": space_id,
-                "host": self.host_id,
+                "host": host_id,
                 "snapshot": payload,
             }
         });
         let req = client
-            .post(&self.config.graphql_url)
+            .post(&url)
             .header("Content-Type", "application/json")
             .json(&body);
         let req = self.with_auth(req);

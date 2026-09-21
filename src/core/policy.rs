@@ -185,6 +185,8 @@ impl ExecutionPolicy {
             | CommandAction::ShowConnectors
             | CommandAction::ShowAudit { .. }
             | CommandAction::ShowStorage
+            | CommandAction::Search { .. }
+            | CommandAction::ShowObservability
             | CommandAction::Help { .. } => Permission::ViewSystemMetrics,
             CommandAction::KillProcess { .. } => Permission::KillProcess,
             CommandAction::ReniceProcess { .. } => Permission::ReniceProcess,
