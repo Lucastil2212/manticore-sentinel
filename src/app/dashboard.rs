@@ -2533,62 +2533,27 @@ impl SentinelDashboard {
                 .show(ui, |ui| {
                     if let Some(snapshot) = self.connector_summary.snapshot_for("PeerWeave") {
                         let payload = snapshot.data.get("data").unwrap_or(&snapshot.data);
-                        let node = payload.get("node").cloned().unwrap_or_default();
-                        let graph = payload.get("graph").cloned().unwrap_or_default();
+                        let stats = payload.get("stats").cloned().unwrap_or_default();
+                        let graph_nodes = stats.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let graph_edges = stats.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0);
                         ui.label(
                             RichText::new(format!(
-                                "Node: {}  |  Status: {}  |  Uptime: {}s",
-                                node.get("peerId")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                node.get("status")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                node.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0)
+                                "Graph nodes: {}  |  Graph edges: {}",
+                                graph_nodes, graph_edges
                             ))
                             .strong(),
                         );
-                        ui.label(format!(
-                            "Peers: {}  |  Graph nodes: {}  |  Graph edges: {}",
-                            node.get("peers")
-                                .and_then(|p| p.get("count"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0),
-                            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0)
-                        ));
-                        let peers = node
-                            .get("peers")
-                            .and_then(|p| p.get("count"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let graph_nodes =
-                            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let graph_edges =
-                            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                        render_topology_map(ui, peers, graph_nodes, graph_edges);
-                        if let Some(spaces) = payload.get("spaces").and_then(|v| v.as_array()) {
-                            ui.label(RichText::new("Spaces").strong());
-                            if spaces.is_empty() {
-                                ui.label("No spaces returned.");
-                            } else {
-                                for space in spaces.iter().take(16) {
-                                    let name = space
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unnamed");
-                                    let sync = space
-                                        .get("syncState")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
-                                    let ops =
-                                        space.get("opsCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    ui.label(format!("{name} · sync={sync} · ops={ops}"));
-                                }
+                        render_topology_map(ui, 0, graph_nodes, graph_edges);
+                        if let Some(nodes) = payload.get("allNodes").and_then(|v| v.as_array()) {
+                            ui.label(RichText::new("Recent graph sample").strong());
+                            for node in nodes.iter().take(8) {
+                                let label = node.get("label").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                                let kind = node.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                ui.label(format!("{label} · {kind}"));
                             }
                         }
                     } else {
-                        ui.label("Waiting for PeerWeave snapshot data...");
+                        ui.label("Waiting for PeerWeave GraphQL data...");
                     }
                 });
         }
