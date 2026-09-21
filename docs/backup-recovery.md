@@ -2,33 +2,35 @@
 
 ## Backup
 
-Create a state backup archive:
+```bash
+./scripts/backup-state.sh
+./scripts/backup-state.sh /path/to/backups
+```
 
-`./scripts/backup-state.sh`
+Included when present:
 
-Optional output directory:
+- `.beads/config.yaml`, `.beads/metadata.json`
+- `.beads/audit/` (events, merkle state, signing key)
+- `.beads/state/sentinel.sqlite` (+ WAL/SHM)
+- `config/profiles/` except `*.local.env`
+- Security docs (`SECURITY.md`, threat model, checklist, performance baseline)
 
-`./scripts/backup-state.sh /path/to/backups`
+Archives can contain host process names, audit actions, and the audit signing
+key. Store them with the same care as secrets. Default output is `backups/`
+(gitignored).
 
-Included artifacts:
-
-- `.beads/config.yaml`
-- `.beads/metadata.json`
-- `.beads/audit/`
-- `config/profiles/`
-- key security/performance docs
+Also back up `MANTICORE_STORE_PATH` if you relocated SQLite outside
+`.beads/state/`.
 
 ## Restore
 
-Restore from archive:
+```bash
+./scripts/restore-state.sh /path/to/manticore-state-YYYYMMDD-HHMMSS.tar.gz
+```
 
-`./scripts/restore-state.sh /path/to/manticore-state-YYYYMMDD-HHMMSS.tar.gz`
+## Safety guidance
 
-## Safety Guidance
-
-- Restore only when the app is stopped.
-- Preserve a copy of the current `.beads/audit/events.jsonl` before overwrite.
-- After restore, run:
-  - `cargo check`
-  - `cargo test`
-  - `cargo run -- --benchmark`
+- Restore only when the app (and Compose) are stopped.
+- Copy the current `.beads/audit/events.jsonl` and `signing.ed25519` aside before overwrite.
+- After restore, run `cargo test` and `cargo run -- --benchmark` (or equivalent against the shipped binary).
+- Rotate `MANTICORE_AUTH_TOKEN` / JWTs if the archive or host may have been exposed.

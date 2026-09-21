@@ -119,9 +119,7 @@ pub fn parse_command(input: &str) -> Result<CommandAction, String> {
                 if rest[i] == "--mode" && i + 1 < rest.len() {
                     let v = rest[i + 1].to_ascii_lowercase();
                     if !matches!(v.as_str(), "hybrid" | "fts" | "vector" | "semantic") {
-                        return Err(
-                            "invalid --mode value (expected hybrid|fts|vector)".to_string()
-                        );
+                        return Err("invalid --mode value (expected hybrid|fts|vector)".to_string());
                     }
                     mode = Some(v);
                     i += 2;
@@ -297,7 +295,7 @@ const HELP_CONFIG: &str = "\
 CONFIGURATION — environment variables
 
 Core:
-  MANTICORE_PROFILE             default|dev|secure|ecosystem (default: default)
+  MANTICORE_PROFILE             default|dev|secure|ecosystem|stack (default: default)
   MANTICORE_PRIVILEGED          true|false — enable kill/renice (default: false)
   MANTICORE_HELPER_MODE         embedded|subprocess (default: embedded)
   MANTICORE_REFRESH_MS          Poll interval 100-5000ms (default: 500)
@@ -330,6 +328,7 @@ Storage / search:
   MANTICORE_SEARCH_ENABLED         true|false (default: true)
   MANTICORE_OBS_HTTP_ENABLED       true|false (default: false; on with --headless)
   MANTICORE_OBS_HTTP_PORT          default 9463
+  MANTICORE_OBS_HTTP_BIND          default 127.0.0.1 (loopback). Use 0.0.0.0 only inside a container whose host ports are published to 127.0.0.1
   MANTICORE_LOG_JSON               true|false structured tracing
 
 PeerWeave:
@@ -514,6 +513,8 @@ Examples:
   search --mode vector high cpu process
 
 Observability HTTP (optional, always on with --headless):
+  Binds 127.0.0.1 by default. Token/evrus modes require
+  Authorization: Bearer <secret> on every route except GET /health.
   GET /health
   GET /metrics
   GET /api/search?q=nginx&mode=hybrid
@@ -521,7 +522,7 @@ Observability HTTP (optional, always on with --headless):
   GET /api/metrics/series
   GET /api/logs
 
-Docker:
+Docker (host ports published to 127.0.0.1 only):
   docker compose --profile stack up -d
   docker compose --profile sentinel up -d";
 
@@ -538,11 +539,11 @@ default  — Minimal standalone. Local auth, no connectors.
 
 dev      — Development mode. Verbose logging, fast refresh.
 
-secure   — Token auth, restricted capabilities.
-           Suitable for shared workstations.
+secure   — Token auth, subprocess helper. Export MANTICORE_AUTH_TOKEN
+           (and issued-at/TTL) in the environment; never commit secrets.
 
-ecosystem — Full integration. EVRUS auth, PeerWeave + EVRUS connectors,
-            audit anchoring, snapshot history. For production fleet use.
+ecosystem — EVRUS auth + PeerWeave/EVRUS connectors. Supply JWT, CapToken,
+            and RPC credentials via environment, not the committed profile.
 
 Profile files are in config/profiles/. Create custom profiles by
 adding new .env files to that directory.";

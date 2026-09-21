@@ -153,9 +153,42 @@ fn now_ts() -> u64 {
         .as_secs()
 }
 
+/// Extracts the token from `Authorization: Bearer …` (scheme is case-insensitive).
+pub fn extract_bearer(authorization_header: &str) -> Option<&str> {
+    let header = authorization_header.trim();
+    let value = if let Some(rest) = header.strip_prefix("Bearer ") {
+        rest
+    } else if header.len() >= 7 && header[..7].eq_ignore_ascii_case("bearer ") {
+        &header[7..]
+    } else {
+        return None;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Returns true only when a non-empty expected secret matches the Bearer token.
+/// Empty expected secrets never authenticate (fail closed).
+pub fn bearer_equals(authorization_header: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(header) = authorization_header else {
+        return false;
+    };
+    extract_bearer(header) == Some(expected)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AuthContext, AuthGate, AuthMode, Permission, Role, TokenLifecycle};
+    use super::{
+        bearer_equals, extract_bearer, AuthContext, AuthGate, AuthMode, Permission, Role,
+        TokenLifecycle,
+    };
 
     #[test]
     fn viewer_is_read_only() {
@@ -225,5 +258,23 @@ mod tests {
             .verify_submission(Some("sentinel-secret"))
             .expect_err("expired token should fail");
         assert!(err.contains("expired"));
+    }
+
+    #[test]
+    fn extract_bearer_is_case_insensitive() {
+        assert_eq!(extract_bearer("Bearer abc"), Some("abc"));
+        assert_eq!(extract_bearer("bearer abc"), Some("abc"));
+        assert_eq!(extract_bearer("BEARER abc"), Some("abc"));
+        assert_eq!(extract_bearer("Basic abc"), None);
+        assert_eq!(extract_bearer("Bearer "), None);
+    }
+
+    #[test]
+    fn bearer_equals_fails_closed_on_empty_secret() {
+        assert!(!bearer_equals(Some("Bearer secret"), None));
+        assert!(!bearer_equals(Some("Bearer secret"), Some("")));
+        assert!(!bearer_equals(None, Some("secret")));
+        assert!(!bearer_equals(Some("Bearer other"), Some("secret")));
+        assert!(bearer_equals(Some("Bearer secret"), Some("secret")));
     }
 }

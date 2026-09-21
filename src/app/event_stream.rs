@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::security::auth::AuthMode;
+use crate::security::auth::{bearer_equals, AuthMode};
 
 #[derive(Clone)]
 pub struct EventStreamOutput {
@@ -103,22 +103,12 @@ fn authorize_client(
     match auth_mode {
         AuthMode::Local => {}
         AuthMode::Token => {
-            let expected = token_secret.unwrap_or_default();
-            let provided = auth_header
-                .as_deref()
-                .and_then(|h| h.strip_prefix("Bearer "))
-                .unwrap_or_default();
-            if provided != expected {
+            if !bearer_equals(auth_header.as_deref(), token_secret) {
                 anyhow::bail!("token auth failed");
             }
         }
         AuthMode::Evrus => {
-            let expected = evrus_jwt.unwrap_or_default();
-            let provided = auth_header
-                .as_deref()
-                .and_then(|h| h.strip_prefix("Bearer "))
-                .unwrap_or_default();
-            if provided != expected {
+            if !bearer_equals(auth_header.as_deref(), evrus_jwt) {
                 anyhow::bail!("evrus auth failed");
             }
         }

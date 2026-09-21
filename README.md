@@ -1,197 +1,128 @@
 # Manticore Sentinel
 
-Desktop operator console for live system telemetry and capability-gated actions. Built for [Manticore Technology](https://manticore.technology) security operations: clear defaults for new users, progressive disclosure for advanced operators, and an audit trail for sensitive actions.
+[![quality-gates](https://github.com/Lucastil2212/manticore-sentinel/actions/workflows/quality-gates.yml/badge.svg)](https://github.com/Lucastil2212/manticore-sentinel/actions/workflows/quality-gates.yml)
 
-## For users
+Linux operator console for live host telemetry, capability-gated process actions, and an append-only audit trail. Sentinel is a standalone Rust + egui desktop application. Optional HTTP connectors talk to PeerWeave and EVRUS over GraphQL, OIDC, and JSON-RPC — never by sharing libraries.
 
-### What you get
+**This is a privileged host tool, not a public internet service.** Default HTTP listeners bind loopback. Compose publishes ports on `127.0.0.1` only. See [SECURITY.md](SECURITY.md).
 
-- **Live snapshot**: CPU, memory, disk and network throughput, and top processes.
-- **Command palette**: Approved commands only (no shell injection). Destructive actions require confirmation and policy checks.
-- **Security posture**: Trust mode (privileged vs unprivileged helper), role-based permissions, optional token auth, and append-only audit events.
-- **In-app help**: **Help Center** and **Security Guide** windows plus hover tooltips on major controls.
+## Features
 
-### Requirements
+- Live CPU, memory, disk, network, and process snapshot from `/proc` and `/sys`
+- Allowlisted command palette (no shell). Kill/renice go through a Unix-socket helper
+- RBAC: `local | token | evrus` × `viewer | operator | admin`
+- Append-only JSONL audit with Ed25519 signatures
+- SQLite WAL store with hybrid FTS5 / hashed-vector / RRF search
+- Optional loopback observability HTTP (`/health`, `/metrics`, search and logs APIs)
+- Optional Docker Compose lab stack (each service is profile-gated)
 
-- **Rust** toolchain (see [Developers](#developers) for versions).
-- **Linux** recommended for full functionality (helper uses Unix domain sockets and process signals).
+## Requirements
 
-### Run the application
+- Linux (full functionality: Unix-domain helper, `/proc` collectors)
+- Rust stable toolchain (edition 2021)
+- Optional: Docker Engine with Compose v2
 
-From the repository root:
+## Quick start
 
 ```bash
+git clone https://github.com/Lucastil2212/manticore-sentinel.git
+cd manticore-sentinel
 cargo run --release
 ```
 
-Optional: load a predefined environment profile (see `config/profiles/`):
+Load an example profile (see [`config/profiles/README.md`](config/profiles/README.md)):
 
 ```bash
 cargo run --release -- --profile dev
 ```
 
+Token mode does not ship a secret. Generate one, then start:
+
 ```bash
+export MANTICORE_AUTH_TOKEN="$(openssl rand -hex 16)"
+export MANTICORE_AUTH_TOKEN_ISSUED_AT="$(date +%s)"
 cargo run --release -- --profile secure
 ```
 
-Profiles set variables such as `MANTICORE_PRIVILEGED`, `MANTICORE_HELPER_MODE`, and auth settings. Edit the `.env` files before production use—especially tokens.
+## Security model (short)
 
-### Command palette (quick reference)
+| Surface | Default |
+|---------|---------|
+| Collectors | Unprivileged reads of `/proc` and `/sys` |
+| Kill / renice | Helper over a `0600` Unix socket; denied unless privileged + role allows it |
+| Observability HTTP | Off unless enabled; bind `127.0.0.1:9463`; `token`/`evrus` require `Authorization: Bearer` except `GET /health` |
+| Event stream (SSE) | `127.0.0.1:9462`; same Bearer rules |
+| Compose ports | Published as `127.0.0.1:<port>:<port>` |
+| Secrets | Not in git. Use environment variables or gitignored `*.local.env` overlays |
+
+Do not bind `0.0.0.0` on an untrusted network. Do not commit tokens, JWTs, RPC passwords, or `.env` files.
+
+Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+
+## Command palette
 
 | Command | Purpose |
-|--------|---------|
-| `show cpu` | Read-only acknowledgment (audited). |
-| `renice <nice> <pid>` | Adjust process nice value via helper (requires permission + privileged helper when applicable). |
-| `kill <pid>` | Request termination via helper; requires typed confirmation and policy permission. |
+|---------|---------|
+| `show cpu` | Read-only acknowledgment (audited) |
+| `search nginx` | Hybrid FTS / vector search |
+| `renice <nice> <pid>` | Nice adjustment via helper |
+| `kill <pid>` | Termination via helper; typed confirmation |
 
 Shell metacharacters (`|`, `;`, `&`, `>`, `<`) are rejected.
 
-### Important environment variables
-
-| Variable | Meaning |
-|----------|---------|
-| `MANTICORE_PROFILE` | Logical profile name (default `default`). |
-| `MANTICORE_PRIVILEGED` | When true, helper may expose kill/renice capabilities. |
-| `MANTICORE_HELPER_MODE` | `embedded` or `subprocess` helper execution. |
-| `MANTICORE_REFRESH_MS` | Snapshot refresh interval in ms (100–5000). |
-| `MANTICORE_AUTH_MODE` | `local` or `token`. |
-| `MANTICORE_ROLE` | `viewer`, `operator`, or `admin`. |
-| `MANTICORE_AUTH_TOKEN` | Required in token mode (minimum length enforced). |
-| `MANTICORE_AUTH_TOKEN_ISSUED_AT` | Unix seconds (token mode). |
-| `MANTICORE_AUTH_TOKEN_TTL_SECS` | Token lifetime (token mode). |
-| `MANTICORE_AUTH_TOKEN_GRACE_SECS` | Optional grace window (token mode). |
-| `MANTICORE_STORE_ENABLED` | SQLite WAL store (default true). |
-| `MANTICORE_SEARCH_ENABLED` | Hybrid FTS/vector indexing (default true). |
-| `MANTICORE_OBS_HTTP_ENABLED` | Observability HTTP API (default false; on with `--headless`). |
-| `MANTICORE_OBS_HTTP_PORT` | Observability port (default 9463). |
-| `MANTICORE_LOG_JSON` | JSON tracing output. |
-
-Full auth and RBAC semantics are documented in `docs/auth-rbac-model.md`.
-
-### Advanced controls in the UI
-
-Expand **Advanced Controls** (collapsed by default) to see helper socket path, audit log path, auth failure counters, lockout state, and raw runtime diagnostic string. Prefer the main view for day-to-day monitoring.
-
-### Logging
-
-Structured logging uses `tracing`. For example:
-
-```bash
-RUST_LOG=debug cargo run --release
-```
-
-### Other modes (CLI)
+## CLI
 
 | Flag | Purpose |
 |------|---------|
-| `--helper-daemon` | Internal: helper subprocess entry (set by the app, not typical for end users). |
-| `--benchmark` | Headless collection benchmark; prints timings to stdout. |
-| `--headless` | Collectors + SQLite store + hybrid search + observability HTTP (no GUI). |
-| `--healthcheck` | Probe `GET /health` on the observability port (used by Docker). |
+| `--profile <name>` | Load `config/profiles/<name>.env`, then optional `<name>.local.env` |
+| `--headless` | Collectors + store + observability HTTP (no GUI) |
+| `--healthcheck` | Probe `GET /health` on loopback (Docker) |
+| `--benchmark` | Headless collection timings |
+| `--helper-daemon` | Internal helper subprocess entry |
 
-### Docker Compose (optional services)
+## Docker Compose (lab)
 
-Each service is profile-gated and starts independently. Connectors degrade if a peer is missing.
+Stand-ins are for local evaluation. They are not production PeerWeave or EVRUS.
 
 ```bash
-docker compose --profile stack up -d          # sentinel + PeerWeave stub + EVRUS OIDC stub
-docker compose --profile sentinel up -d       # telemetry/search only
-docker compose --profile peerweave --profile evrus up -d
+cp .env.example .env   # optional overrides; never commit .env
+docker compose --profile stack up -d
 ```
 
-- Sentinel observability UI: `http://127.0.0.1:9463/`
-- Search API: `http://127.0.0.1:9463/api/search?q=nginx&mode=hybrid`
+Then on this host only:
+
+- Observability UI: `http://127.0.0.1:9463/`
+- Search: `http://127.0.0.1:9463/api/search?q=nginx&mode=hybrid`
 - PeerWeave GraphQL stand-in: `http://127.0.0.1:3200/`
 - EVRUS OIDC stand-in: `http://127.0.0.1:8790/.well-known/openid-configuration`
 
-Replace the stand-ins with live `peer-weave` / `evrus-v0` processes by pointing `MANTICORE_PEERWEAVE_GRAPHQL_URL` and `MANTICORE_EVRUS_OIDC_URL` at them.
+Details: [docs/docker-compose.md](docs/docker-compose.md).
 
-### Hybrid search
+## Documentation
 
-Host, process, connector, and log documents land in a SQLite WAL store (FTS5 + 64-d hashed n-gram vectors, fused with reciprocal rank). In the GUI use **Search & Discovery**; from the palette: `search nginx` or `search --mode vector high cpu`.
+Index: [docs/README.md](docs/README.md).
 
----
+| Document | Topic |
+|----------|--------|
+| [docs/configuration.md](docs/configuration.md) | Environment variables |
+| [docs/auth-rbac-model.md](docs/auth-rbac-model.md) | Auth modes, roles, lockout |
+| [docs/security-threat-model.md](docs/security-threat-model.md) | Assets, boundaries, residual risk |
+| [docs/production-runbook.md](docs/production-runbook.md) | Operator deploy checklist |
+| [docs/manticore-ecosystem-integration.md](docs/manticore-ecosystem-integration.md) | Protocol-only PeerWeave / EVRUS contract |
 
-## For developers
-
-### Prerequisites
-
-- **Rust** with `cargo` (edition 2021; use a current stable toolchain).
-- **Linux** dev environment for running helper and integration-style tests that touch processes/sockets.
-
-### Clone and build
-
-```bash
-git clone <repository-url>
-cd manticore-sentinel
-cargo build --release
-```
-
-### Test
+## Development
 
 ```bash
 cargo test
+cargo run -- --benchmark
 ```
 
-Some tests spawn short-lived processes or use temporary Unix sockets; they expect a normal Linux user session.
+Layout: `src/app` (egui), `src/collectors`, `src/security` (audit, auth, helper), `src/store`, `src/search`, `src/observability`, `src/connectors` (HTTP clients only).
 
-### Run (debug, faster iteration)
+## Contributing
 
-```bash
-cargo run
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md). Do not open public issues that include secrets, host dumps, or exploit details.
 
-### Project layout (high level)
+## License
 
-| Path | Role |
-|------|------|
-| `src/main.rs` | Entry: profiles, config load, benchmark/helper modes, GUI bootstrap. |
-| `src/app/dashboard.rs` | Primary egui UI: telemetry, commands, help, icons, advanced section. |
-| `src/core/` | Engine, snapshot, policy, commands, config, errors. |
-| `src/security/` | Audit trail, auth/RBAC gate, privileged helper (UDS). |
-| `src/collectors/` | Data collectors (CPU, memory, disk, network, processes). |
-| `src/store/` | SQLite WAL metrics/documents/logs (FTS5 + embeddings). |
-| `src/search/` | Hybrid FTS / vector / semantic discovery. |
-| `src/telemetry/` | Background collector so the UI thread never blocks on `/proc` or HTTP. |
-| `src/observability/` | Optional HTTP API, Prometheus text, and analysis dashboard. |
-| `src/models/` | Metric structs shared by collectors and UI. |
-| `assets/icons/` | Custom SVG icons embedded at compile time for the operator UI. |
-| `config/profiles/` | Example `*.env` profiles for local vs secure-style runs. |
-| `docs/` | Deeper operational and security documentation. |
-
-### Configuration loading
-
-`core::config::load_runtime_config()` reads environment variables and validates ranges (e.g. refresh interval, token mode requirements). The GUI dashboard uses the same loader for consistency with CLI startup logging.
-
-### UI assets (SVG)
-
-Icons are included with `include_bytes!` from `assets/icons/`. `egui_extras` registers image loaders once when visuals initialize. New icons should be small, single-purpose SVGs; keep stroke/fill colors aligned with the existing tactical palette if you extend the set.
-
-### Issue tracking (Beads)
-
-This repository may use **Beads** (`.beads/`) for in-repo issues. Typical workflow:
-
-```bash
-bd list
-bd show <issue-id>
-bd create "Title"
-bd update <issue-id> --claim
-```
-
-### Documentation index
-
-- `docs/auth-rbac-model.md` — Authentication modes, roles, permissions, token lifecycle, lockout, audit behavior.
-- Other `docs/*.md` files — Packaging, runbooks, certification gates, etc., as present in your checkout.
-
-### Security notes for contributors
-
-- Do not bypass the command parser for operator input.
-- Keep destructive actions on the helper boundary; avoid `Command::shell` or stringly shell execution.
-- Preserve append-only audit semantics for security-relevant outcomes.
-- When changing auth or policy, update `docs/auth-rbac-model.md` and add or adjust tests in `src/security/`.
-
----
-
-## License and branding
-
-Manticore Sentinel is part of the Manticore Technology product line. Use and distribution terms follow the license file in this repository if one is present; otherwise clarify with the repository owner.
+Copyright © 2026 Manticore Technology. Source is available for evaluation under the terms in [LICENSE](LICENSE). Production use and redistribution require a separate written license.

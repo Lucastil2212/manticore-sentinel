@@ -1,53 +1,75 @@
 # Production Deployment Runbook
 
-## 1) Host Preparation
+Sentinel is a **single-host operator console**. It is not a public web application.
+Production here means a dedicated Linux workstation or server you control, with
+HTTP remaining on loopback unless you have a separate, reviewed exposure design.
 
-- Install Rust toolchain and build dependencies.
-- Ensure target host has access to `/proc` and `/sys` in read-only context for telemetry.
-- Create dedicated operator account for running the app.
+## 1) Host preparation
 
-## 2) Build and Validate
+- Dedicated OS account for the process. Do not run as root.
+- Read access to `/proc` and `/sys` for telemetry.
+- Disk encryption and restricted permissions on:
+  - `.beads/audit/` (events + `signing.ed25519`)
+  - SQLite path (`MANTICORE_STORE_PATH`)
+- Rust toolchain (or a signed binary you built in CI) and build dependencies.
 
-From repository root:
+## 2) Build and validate
 
 ```bash
-cargo check
-cargo test
+cargo check --all-targets
+cargo test --all-targets
 cargo run -- --benchmark
+./scripts/vuln-scan.sh   # requires cargo-audit
 ```
 
-## 3) Secure Defaults
+Confirm CI quality-gates and vulnerability-scan workflows on the commit you ship.
 
-- Prefer profile: `secure`
-  - `MANTICORE_PRIVILEGED=true`
-  - `MANTICORE_HELPER_MODE=subprocess`
-- Start command:
-  - `cargo run -- --profile secure`
-- Ensure helper socket permissions remain owner-only (`0600`).
+## 3) Secure defaults
 
-## 4) Health Checks
+Prefer the `secure` profile **plus exported secrets** (nothing committed):
 
-- Startup diagnostics visible in logs.
-- Benchmark command returns metrics without errors.
-- Command palette accepts `show cpu` and denies privileged actions when expected.
-- Audit stream updates for action attempts.
+```bash
+export MANTICORE_AUTH_TOKEN="$(openssl rand -hex 16)"
+export MANTICORE_AUTH_TOKEN_ISSUED_AT="$(date +%s)"
+export MANTICORE_AUTH_TOKEN_TTL_SECS=86400
+cargo run --release -- --profile secure
+```
 
-## 5) Backup and Recovery
+- `MANTICORE_HELPER_MODE=subprocess`
+- `MANTICORE_PRIVILEGED=true` only if kill/renice are required
+- `MANTICORE_OBS_HTTP_BIND=127.0.0.1` (default)
+- Leave Compose lab stubs off production hosts, or point connectors at real PeerWeave/EVRUS with TLS and real tokens
 
-- Create backup before release switch:
-  - `./scripts/backup-state.sh`
-- Restore if rollback is required:
-  - `./scripts/restore-state.sh <archive>`
+Optional workstation overlay: `config/profiles/secure.local.env` (gitignored).
 
-## 6) Rollback Procedure
+## 4) Health checks
 
-1. Stop running process.
-2. Restore last known-good state archive.
-3. Re-deploy prior tagged binary/build.
-4. Re-run health checks and benchmark mode.
+- Startup log shows profile, privileged flag, `obs_bind`, and helper mode.
+- `show cpu` works; privileged actions deny when the role/mode says they should.
+- Audit stream updates for attempts.
+- If observability is enabled: `curl -sS http://127.0.0.1:9463/health` succeeds; `/api/search` requires Bearer in token mode.
 
-## 7) Post-Deploy Verification
+## 5) Backup and recovery
 
-- Check quality workflows passed in CI.
-- Confirm packaging scaffolds generated successfully.
-- Validate trust mode, diagnostics string, and audit panel in UI.
+```bash
+./scripts/backup-state.sh
+./scripts/restore-state.sh <archive>
+```
+
+Archives include audit data and the SQLite file when present. They may contain
+host process names. Store them like secrets. See [backup-recovery.md](backup-recovery.md).
+
+## 6) Rollback
+
+1. Stop the process (and Compose if used).
+2. Restore the last known-good state archive.
+3. Redeploy the prior tagged binary.
+4. Re-run health checks and `--benchmark`.
+5. Rotate `MANTICORE_AUTH_TOKEN` / JWTs if the old process may have leaked them.
+
+## 7) Post-deploy verification
+
+- Quality and vuln-scan workflows passed for the shipped SHA.
+- Helper socket is `0600`.
+- No listeners on `0.0.0.0` on the host (`ss -lnt` / `ss -lntup`).
+- Trust mode, diagnostics, and audit panel match the intended role.

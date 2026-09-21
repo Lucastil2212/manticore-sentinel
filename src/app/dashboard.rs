@@ -485,7 +485,7 @@ impl SentinelDashboard {
         );
         if cfg.observability.http_enabled {
             let _ = crate::observability::ObservabilityServer::spawn(
-                cfg.observability.http_port,
+                crate::observability::ListenConfig::from_runtime(&cfg),
                 telemetry.clone(),
             );
             runtime_diagnostics = format!(

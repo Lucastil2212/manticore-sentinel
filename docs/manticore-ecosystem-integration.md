@@ -74,9 +74,12 @@ Sentinel owns system observability and operational control. It provides:
 - **Linux telemetry** — CPU, memory, disk, network, process collectors reading `/proc` and `/sys`
 - **Command palette** — Token-parsed, shell-injection-proof command system
 - **Privileged helper** — Capability-gated kill/renice over Unix domain socket
-- **Audit trail** — Append-only JSONL events for every privileged action
-- **RBAC** — Local/token auth modes with viewer/operator/admin roles
+- **Audit trail** — Append-only, Ed25519-signed JSONL events for privileged actions
+- **RBAC** — `local` / `token` / `evrus` with viewer/operator/admin roles
 - **Dashboard** — egui real-time operator interface with trust-state communication
+- **HTTP** — optional loopback observability and SSE; not a public internet control plane
+
+**Public repository posture:** Sentinel is source-available for evaluation. Connectors are protocol-only (HTTP/GraphQL/OIDC/JSON-RPC). Do not share libraries with PeerWeave or EVRUS. See the repository `SECURITY.md`.
 
 **What Sentinel provides to the ecosystem:**
 - Real-time host health data for any machine running Manticore infrastructure

@@ -12,6 +12,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/manticore-sentinel /usr/local/bin/manticore-sentinel
 ENV MANTICORE_OBS_HTTP_ENABLED=true
+ENV MANTICORE_OBS_HTTP_BIND=0.0.0.0
 ENV MANTICORE_STORE_PATH=/var/lib/manticore/sentinel.sqlite
 ENV MANTICORE_EVENT_STREAM_ENABLED=true
 WORKDIR /var/lib/manticore

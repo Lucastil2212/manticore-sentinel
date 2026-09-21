@@ -1,43 +1,62 @@
 # Runtime Profiles
 
-Manticore Sentinel supports profile-based startup via:
+Start with:
 
-`cargo run -- --profile <name>`
+```bash
+cargo run --release -- --profile <name>
+```
 
-Profiles are loaded from `config/profiles/<name>.env`.
+That loads `config/profiles/<name>.env`. Variables **already set in the
+environment are left unchanged**. If `config/profiles/<name>.local.env` exists
+(gitignored), it is applied next and may set secrets.
 
-## Available Profiles
+Tracked profile files are examples. They must not contain tokens, JWTs, or
+passwords. See [config/profiles/README.md](../config/profiles/README.md).
 
-- `dev`
-  - `MANTICORE_PRIVILEGED=false`
-  - `MANTICORE_HELPER_MODE=embedded`
-- `secure`
-  - `MANTICORE_PRIVILEGED=true`
-  - `MANTICORE_HELPER_MODE=subprocess`
-- `ecosystem`
-  - `MANTICORE_AUTH_MODE=evrus`
-  - PeerWeave + EVRUS connectors enabled
-  - Optional PeerWeave graph publish path is scaffolded (disabled by default)
-  - Evrmore audit anchoring enabled (RPC credentials required)
-  - Local snapshot history persistence enabled (`.beads/state/snapshots.jsonl`)
-  - Snapshot history capped at 1000 entries by default
-  - Optional snapshot age/size caps via `MANTICORE_SNAPSHOT_HISTORY_MAX_AGE_SECS` and `MANTICORE_SNAPSHOT_HISTORY_MAX_BYTES`
-  - Optional slim history rows via `MANTICORE_SNAPSHOT_HISTORY_SLIM_RECORDS=true`
-  - Optional startup reset with `MANTICORE_SNAPSHOT_HISTORY_RESET_ON_START=true`
-  - Optional alert policy scaffold via `MANTICORE_ALERT_POLICY_JSON` or `MANTICORE_ALERT_POLICY_PATH`
+## Available profiles
+
+### `dev`
+
+- `MANTICORE_PRIVILEGED=false`
+- `MANTICORE_HELPER_MODE=embedded`
+- `MANTICORE_AUTH_MODE=local`, `MANTICORE_ROLE=viewer`
+
+### `stack`
+
+Lab / Compose companion. Unprivileged, local auth, observability on
+**loopback**. Connector URLs point at `127.0.0.1`. Not a production posture.
+
+### `secure`
+
+- `MANTICORE_PRIVILEGED=true`
+- `MANTICORE_HELPER_MODE=subprocess`
+- `MANTICORE_AUTH_MODE=token`
+
+You must export a unique token **before** start or the process exits:
+
+```bash
+export MANTICORE_AUTH_TOKEN="$(openssl rand -hex 16)"
+export MANTICORE_AUTH_TOKEN_ISSUED_AT="$(date +%s)"
+cargo run --release -- --profile secure
+```
+
+### `ecosystem`
+
+- `MANTICORE_AUTH_MODE=evrus`
+- PeerWeave + EVRUS connectors enabled
+- Publish path scaffolded (disabled by default)
+- Evrmore anchoring enabled (RPC credentials **not** in the file — set them in the environment)
+- Snapshot history enabled under `.beads/state`
 
 ## Examples
 
-- Development profile:
-  - `cargo run -- --profile dev`
-- Secure profile:
-  - `cargo run -- --profile secure`
-- Ecosystem profile:
-  - `cargo run -- --profile ecosystem`
+```bash
+cargo run --release -- --profile dev
+cargo run --release -- --profile stack
+```
 
 ## Notes
 
-- Explicit environment variables in your shell can still override behavior if set after profile loading.
-- Profile files are plain key-value env declarations with `#` comments supported.
-- `ecosystem` profile includes placeholder secrets/tokens; replace before use.
-- Global defaults keep snapshot history disabled unless explicitly enabled by profile or env var.
+- Profile files are `KEY=value` with `#` comments.
+- Do not copy production secrets into `config/profiles/*.env`.
+- Snapshot history stays off unless a profile or env var enables it.

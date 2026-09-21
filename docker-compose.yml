@@ -1,13 +1,15 @@
 name: manticore-stack
 
-# Every service is profile-gated and has no hard dependency on another.
-# Start only what you need; connectors degrade if a peer is absent.
+# Lab stack. Every service is profile-gated and has no hard dependency on another.
+# Host ports are published on loopback only. Do not change 127.0.0.1 publishes
+# unless you have put token/evrus auth in front of every HTTP surface.
 #
+#   docker compose --profile stack up -d
 #   docker compose --profile sentinel up -d
 #   docker compose --profile peerweave --profile evrus up -d
-#   docker compose --profile stack up -d
 #
 # Profiles: sentinel, peerweave, evrus, observe, stack
+# Copy .env.example to .env for local overrides. Never commit .env.
 
 services:
   sentinel:
@@ -16,7 +18,11 @@ services:
     build:
       context: .
       dockerfile: docker/sentinel/Dockerfile
+    # Shares the host PID namespace so collectors can see host processes.
+    # Linux only. Do not combine with privileged: true.
     pid: host
+    security_opt:
+      - no-new-privileges:true
     environment:
       MANTICORE_PROFILE: stack
       MANTICORE_REFRESH_MS: ${MANTICORE_REFRESH_MS:-1000}
@@ -25,6 +31,8 @@ services:
       MANTICORE_SEARCH_ENABLED: "true"
       MANTICORE_OBS_HTTP_ENABLED: "true"
       MANTICORE_OBS_HTTP_PORT: "9463"
+      # In-container bind. Host mapping below is loopback-only.
+      MANTICORE_OBS_HTTP_BIND: "0.0.0.0"
       MANTICORE_EVENT_STREAM_ENABLED: "true"
       MANTICORE_EVENT_STREAM_PORT: "9462"
       MANTICORE_PEERWEAVE_ENABLED: ${MANTICORE_PEERWEAVE_ENABLED:-true}
@@ -38,8 +46,8 @@ services:
     volumes:
       - sentinel-data:/var/lib/manticore
     ports:
-      - "9462:9462"
-      - "9463:9463"
+      - "127.0.0.1:9462:9462"
+      - "127.0.0.1:9463:9463"
     healthcheck:
       test: ["CMD", "manticore-sentinel", "--healthcheck"]
       interval: 15s
@@ -57,7 +65,7 @@ services:
       PW_GRAPHQL_TOKEN: ${MANTICORE_PEERWEAVE_CAP_TOKEN:-}
       PW_SPACE_ID: ${MANTICORE_PEERWEAVE_PUBLISH_SPACE_ID:-sentinel-space}
     ports:
-      - "3200:3200"
+      - "127.0.0.1:3200:3200"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3200/health')"]
       interval: 10s
@@ -74,7 +82,7 @@ services:
       OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-http://evrus-oidc:8790}
       EVRUS_SIOP_ISS: ${EVRUS_SIOP_ISS:-did:key:z6MkDemo}
     ports:
-      - "8790:8790"
+      - "127.0.0.1:8790:8790"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health')"]
       interval: 10s
@@ -102,7 +110,7 @@ services:
     environment:
       SENTINEL_OBS_URL: http://sentinel:9463
     ports:
-      - "8088:8088"
+      - "127.0.0.1:8088:8088"
 
 volumes:
   sentinel-data:

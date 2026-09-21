@@ -92,6 +92,7 @@ pub struct SearchConfig {
 pub struct ObservabilityConfig {
     pub http_enabled: bool,
     pub http_port: u16,
+    pub http_bind: String,
     pub log_json: bool,
 }
 
@@ -275,12 +276,24 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
                 .join("sentinel.sqlite")
         });
     let search_enabled = parse_bool_env("MANTICORE_SEARCH_ENABLED", true).unwrap_or(true);
-    let obs_http_enabled =
-        parse_bool_env("MANTICORE_OBS_HTTP_ENABLED", false).unwrap_or(false);
+    let obs_http_enabled = parse_bool_env("MANTICORE_OBS_HTTP_ENABLED", false).unwrap_or(false);
     let obs_http_port = std::env::var("MANTICORE_OBS_HTTP_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(9463);
+    let obs_http_bind = std::env::var("MANTICORE_OBS_HTTP_BIND")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    if !is_loopback_bind(&obs_http_bind) {
+        warnings.push(ConfigWarning {
+            area: "Observability",
+            message: format!(
+                "MANTICORE_OBS_HTTP_BIND={obs_http_bind} is not loopback; do not expose this port on untrusted networks"
+            ),
+        });
+    }
     let log_json = parse_bool_env("MANTICORE_LOG_JSON", false).unwrap_or(false);
 
     Ok(RuntimeConfig {
@@ -308,6 +321,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         observability: ObservabilityConfig {
             http_enabled: obs_http_enabled,
             http_port: obs_http_port,
+            http_bind: obs_http_bind,
             log_json,
         },
         config_warnings: warnings,
@@ -408,4 +422,22 @@ fn parse_u64_env(key: &str) -> anyhow::Result<u64> {
     let raw = std::env::var(key).map_err(|_| anyhow::anyhow!("{key} is required"))?;
     raw.parse::<u64>()
         .map_err(|_| anyhow::anyhow!("{key} must be an integer"))
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    matches!(bind.trim(), "127.0.0.1" | "::1" | "localhost" | "[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_bind;
+
+    #[test]
+    fn loopback_bind_detection() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("192.168.1.10"));
+    }
 }

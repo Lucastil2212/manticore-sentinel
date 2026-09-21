@@ -4,23 +4,59 @@ use std::thread;
 
 use serde_json::{json, Value};
 
+use crate::core::config::RuntimeConfig;
 use crate::search::{discover, hybrid_search, SearchMode};
+use crate::security::auth::{bearer_equals, AuthMode};
 use crate::telemetry::TelemetryHandle;
 use crate::utils::time::now_unix_secs;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
 #[derive(Clone)]
+pub struct ListenConfig {
+    pub bind: String,
+    pub port: u16,
+    pub auth_mode: AuthMode,
+    pub token_secret: Option<String>,
+    pub evrus_jwt: Option<String>,
+}
+
+impl ListenConfig {
+    pub fn from_runtime(cfg: &RuntimeConfig) -> Self {
+        Self {
+            bind: cfg.observability.http_bind.clone(),
+            port: cfg.observability.http_port,
+            auth_mode: cfg.auth_mode,
+            token_secret: cfg.auth_token.clone(),
+            evrus_jwt: cfg.connectors.evrus.as_ref().and_then(|ev| ev.jwt.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ObservabilityServer {
     telemetry: TelemetryHandle,
+    auth_mode: AuthMode,
+    token_secret: Option<String>,
+    evrus_jwt: Option<String>,
 }
 
 impl ObservabilityServer {
-    pub fn spawn(port: u16, telemetry: TelemetryHandle) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
+    pub fn spawn(listen: ListenConfig, telemetry: TelemetryHandle) -> anyhow::Result<()> {
+        let listener = TcpListener::bind((listen.bind.as_str(), listen.port))?;
         listener.set_nonblocking(false)?;
-        tracing::info!(port, "observability HTTP listening");
-        let server = Self { telemetry };
+        tracing::info!(
+            bind = %listen.bind,
+            port = listen.port,
+            auth_mode = listen.auth_mode.as_str(),
+            "observability HTTP listening"
+        );
+        let server = Self {
+            telemetry,
+            auth_mode: listen.auth_mode,
+            token_secret: listen.token_secret,
+            evrus_jwt: listen.evrus_jwt,
+        };
         thread::Builder::new()
             .name("sentinel-observe".into())
             .spawn(move || {
@@ -38,6 +74,20 @@ impl ObservabilityServer {
         Ok(())
     }
 
+    fn authorized(&self, req: &str) -> bool {
+        match self.auth_mode {
+            AuthMode::Local => true,
+            AuthMode::Token => bearer_equals(
+                request_header(req, "authorization"),
+                self.token_secret.as_deref(),
+            ),
+            AuthMode::Evrus => bearer_equals(
+                request_header(req, "authorization"),
+                self.evrus_jwt.as_deref(),
+            ),
+        }
+    }
+
     fn handle(&self, mut stream: TcpStream) -> anyhow::Result<()> {
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf)?;
@@ -50,14 +100,25 @@ impl ObservabilityServer {
             return write_response(&mut stream, 405, "text/plain", b"method not allowed");
         }
         let (route, query) = split_query(path);
+        if route != "/health" && !self.authorized(&req) {
+            return write_response(&mut stream, 401, "text/plain", b"unauthorized");
+        }
         match route {
-            "/" | "/index.html" => {
-                write_response(&mut stream, 200, "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes())
-            }
+            "/" | "/index.html" => write_response(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                DASHBOARD_HTML.as_bytes(),
+            ),
             "/health" => write_json(&mut stream, self.health()),
             "/metrics" => {
                 let body = self.prometheus();
-                write_response(&mut stream, 200, "text/plain; version=0.0.4", body.as_bytes())
+                write_response(
+                    &mut stream,
+                    200,
+                    "text/plain; version=0.0.4",
+                    body.as_bytes(),
+                )
             }
             "/api/search" => {
                 let q = query_param(&query, "q").unwrap_or_default();
@@ -68,7 +129,10 @@ impl ObservabilityServer {
                     .clamp(1, 50);
                 write_json(&mut stream, self.search(&q, mode, limit))
             }
-            "/api/discover" => write_json(&mut stream, self.discover(query_param(&query, "q").unwrap_or(""))),
+            "/api/discover" => write_json(
+                &mut stream,
+                self.discover(query_param(&query, "q").unwrap_or("")),
+            ),
             "/api/metrics/series" => {
                 let limit = query_param(&query, "limit")
                     .and_then(|v| v.parse::<usize>().ok())
@@ -227,6 +291,21 @@ fn split_query(path: &str) -> (&str, &str) {
     }
 }
 
+fn request_header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
+    for line in req.lines().skip(1) {
+        if line.is_empty() || line == "\r" {
+            break;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.eq_ignore_ascii_case(name) {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
@@ -251,15 +330,35 @@ fn write_response(
 ) -> anyhow::Result<()> {
     let reason = match status {
         200 => "OK",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Error",
     };
+    let www_authenticate = if status == 401 {
+        "WWW-Authenticate: Bearer realm=\"sentinel\"\r\n"
+    } else {
+        ""
+    };
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n{www_authenticate}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_header;
+
+    #[test]
+    fn request_header_reads_authorization() {
+        let req =
+            "GET /api/search HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\n\r\n";
+        assert_eq!(request_header(req, "authorization"), Some("Bearer secret"));
+        assert_eq!(request_header(req, "host"), Some("127.0.0.1"));
+        assert_eq!(request_header(req, "missing"), None);
+    }
 }

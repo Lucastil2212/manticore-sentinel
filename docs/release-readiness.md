@@ -17,6 +17,7 @@ All gates must pass before tagging:
 - [ ] `cargo run -- --benchmark`
 - [ ] security checklist complete (`docs/security-checklist.md`)
 - [ ] threat model reviewed (`docs/security-threat-model.md`)
+- [ ] no secrets, `.env`, or placeholder tokens in tracked files
 - [ ] packaging scaffolds validated (AppImage + Flatpak docs followed)
 
 ## Changelog Process

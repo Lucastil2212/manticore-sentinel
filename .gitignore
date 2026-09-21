@@ -14,3 +14,20 @@
 /target
 __pycache__/
 *.py[cod]
+
+# Local secrets and operator overrides — never commit
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+config/profiles/*.local.env
+
+# Runtime data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+backups/

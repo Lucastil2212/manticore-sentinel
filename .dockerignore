@@ -1,8 +1,14 @@
 target
 .git
 .beads
+.env
+.env.*
+secrets
 **/*.sqlite
 **/*.sqlite-wal
 **/*.sqlite-shm
+**/*.pem
+**/*.key
 dist
 node_modules
+backups

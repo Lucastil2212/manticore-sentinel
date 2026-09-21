@@ -33,6 +33,8 @@ fn main() -> anyhow::Result<()> {
         store = %config.store.path.display(),
         search = config.search.enabled,
         obs_http = config.observability.http_enabled,
+        obs_bind = %config.observability.http_bind,
+        obs_port = config.observability.http_port,
         log_json = config.observability.log_json,
         "startup diagnostics"
     );
@@ -95,31 +97,51 @@ fn profile_arg(args: &[String]) -> Option<String> {
 
 fn load_profile_env(profile: &str) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let path = cwd
-        .join("config")
-        .join("profiles")
-        .join(format!("{profile}.env"));
-    let raw = std::fs::read_to_string(&path)
+    let dir = cwd.join("config").join("profiles");
+    let path = dir.join(format!("{profile}.env"));
+    apply_env_file(&path, false)?;
+    tracing::debug!(profile = %profile, path = %path.display(), "profile environment applied");
+    let local = dir.join(format!("{profile}.local.env"));
+    if local.exists() {
+        apply_env_file(&local, true)?;
+        tracing::info!(path = %local.display(), "local profile overlay applied");
+    }
+    Ok(())
+}
+
+fn apply_env_file(path: &std::path::Path, overwrite: bool) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read profile {}: {}", path.display(), e))?;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            // SAFETY: called before any threads are spawned (early main, single-threaded).
-            unsafe { std::env::set_var(k.trim(), v.trim()) };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
         }
+        if !overwrite && std::env::var_os(key).is_some() {
+            continue;
+        }
+        // SAFETY: called before any threads are spawned (early main, single-threaded).
+        unsafe { std::env::set_var(key, v.trim()) };
     }
-    tracing::debug!(profile = %profile, path = %path.display(), "profile environment applied");
     Ok(())
 }
 
 fn run_headless(config: core::config::RuntimeConfig) -> anyhow::Result<()> {
     let telemetry = telemetry::TelemetryHandle::spawn(&config)?;
     if config.observability.http_enabled {
-        observability::ObservabilityServer::spawn(config.observability.http_port, telemetry.clone())?;
+        observability::ObservabilityServer::spawn(
+            observability::ListenConfig::from_runtime(&config),
+            telemetry.clone(),
+        )?;
         tracing::info!(
+            bind = %config.observability.http_bind,
             port = config.observability.http_port,
             "observability UI at / and /api/search"
         );
@@ -129,7 +151,11 @@ fn run_headless(config: core::config::RuntimeConfig) -> anyhow::Result<()> {
             es.port,
             config.auth_mode,
             config.auth_token.clone(),
-            config.connectors.evrus.as_ref().and_then(|ev| ev.jwt.clone()),
+            config
+                .connectors
+                .evrus
+                .as_ref()
+                .and_then(|ev| ev.jwt.clone()),
         ) {
             Ok(stream) => {
                 tracing::info!(port = es.port, "event stream listening");

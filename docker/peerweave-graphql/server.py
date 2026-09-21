@@ -101,6 +101,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if not TOKEN:
+        print(
+            "WARNING: PW_GRAPHQL_TOKEN is empty; GraphQL is unauthenticated (lab only)",
+            flush=True,
+        )
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"peerweave-graphql listening on {PORT}")
     server.serve_forever()
