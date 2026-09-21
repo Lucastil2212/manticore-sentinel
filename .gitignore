@@ -12,3 +12,5 @@
 # Added by cargo
 
 /target
+__pycache__/
+*.py[cod]

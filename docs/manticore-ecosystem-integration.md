@@ -3,8 +3,10 @@
 ## Source of Truth for Cross-Project Architecture
 
 **Status:** Active design contract
+**Updated:** September 18, 2026 — added Manticore Asset Exchange as a fourth product with an explicit non-compatibility boundary against EVRUS Trade and PeerWeave wire formats. EVRUS source of truth for that adapter is `evrus-v0`.
 **Canonical location:** `manticore-sentinel/docs/manticore-ecosystem-integration.md`
 **Copies:** `peer-weave/docs/manticore-ecosystem-integration.md`, `evrus-v0/docs/manticore-ecosystem-integration.md`
+**Related:** `manticore-exchange/docs/ECOSYSTEM.md`
 **Date:** April 12, 2026
 **Author:** Lucas Tilford
 
@@ -14,10 +16,11 @@ When this document conflicts with a project-local design doc, resolve by updatin
 
 ## 1. Ecosystem Vision
 
-Manticore Technologies builds local-first, verifiable infrastructure. Three flagship products form the operational backbone:
+Manticore Technologies builds local-first, verifiable infrastructure. Four flagship products form the operational backbone:
 
 - **PeerWeave** — Local-first CRDT workspaces, P2P identity/sync, semantic knowledge graph, agent-native runtime. The collaboration and intelligence substrate.
-- **EVRUS Vault** — Sovereign identity, Evrmore wallet, policy-gated asset operations, encrypted messaging. The identity and value layer, connected to the Evrmore blockchain.
+- **EVRUS Vault** (`evrus-v0`) — Sovereign identity, Evrmore wallet, policy-gated asset operations, encrypted messaging. The identity and value layer, connected to the Evrmore blockchain.
+- **Manticore Asset Exchange** — Noncustodial public discovery relay and atomic swap coordination (`max.*.v1`). Hosted on Render without wallets.
 - **Manticore Sentinel** — Zero-trust, kernel-proximate Linux observability console with capability-gated privileged actions and append-only audit. The operations layer.
 
 The vision is:
@@ -79,6 +82,22 @@ Sentinel owns system observability and operational control. It provides:
 - Real-time host health data for any machine running Manticore infrastructure
 - An auditable record of operational actions taken on those machines
 - A single pane of glass showing system, PeerWeave, and EVRUS status
+
+### 2.4 Manticore Asset Exchange — Public Discovery Relay
+
+Manticore Asset Exchange (MAX) is the hosted, **noncustodial** public marketplace. Evrmore settles ownership; a local companion holds signing authority; a Render HTTPS relay publishes signed offers and ciphertext. It is **not** wire-compatible with EVRUS Trade (`/evrus/trade/offers/1.0.0`) or PeerWeave actor envelopes.
+
+**What MAX provides:**
+- Public `max.offer.v1` discovery (FTS5 + local LSA) and a provenance graph of maker assertions
+- Dual-authenticated `max.envelope.v1` coordination (X-Wing / ML-DSA-65 + Ed25519)
+- Interactive atomic settlement of one Evrmore transaction (`max.swap.v1`)
+- A testnet-only Render Blueprint; wallets, vaults, and Core RPC never run on Render
+
+**Identity boundary:** MAX fingerprints are `mx1_` hashes of the MAX key bundle. They are not `did:key`, libp2p PeerIds, or `.evr` names. Do not import EVRUS or PeerWeave keys into a MAX vault.
+
+**Adapter (evrus-v0):** Core RPC env alias `EVR_RPC_PASS` → `EVR_RPC_PASSWORD`. An EVRUS offer may be translated into an **unsigned MAX publish draft**. The maker must re-sign with a MAX identity after reviewing exact integer quantities. Source tree: `evrus-v0` (not the production-1.0 `evrus` cutdown).
+
+**PeerWeave:** no MAX marketplace client. Spaces, receipts, and libp2p circuit relay remain the PeerWeave product. A future Port that *displays* MAX public search would be a client of `GET /api/search`, not a shared library.
 
 ---
 
@@ -554,6 +573,7 @@ The integration is successful when:
 4. Multiple Sentinel instances publishing to the same PeerWeave space produce a queryable fleet-wide view of host health.
 5. Audit trail Merkle roots anchored to Evrmore can be independently verified by replaying the JSONL and checking the on-chain hash.
 6. None of this breaks if PeerWeave or EVRUS is unavailable — connectors degrade gracefully.
+7. Hybrid search (FTS5 + local vectors) and observability HTTP can run headless via `--headless` or `docker compose --profile stack up -d`, with each Compose service optional.
 
 ---
 

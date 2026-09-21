@@ -60,6 +60,11 @@ Shell metacharacters (`|`, `;`, `&`, `>`, `<`) are rejected.
 | `MANTICORE_AUTH_TOKEN_ISSUED_AT` | Unix seconds (token mode). |
 | `MANTICORE_AUTH_TOKEN_TTL_SECS` | Token lifetime (token mode). |
 | `MANTICORE_AUTH_TOKEN_GRACE_SECS` | Optional grace window (token mode). |
+| `MANTICORE_STORE_ENABLED` | SQLite WAL store (default true). |
+| `MANTICORE_SEARCH_ENABLED` | Hybrid FTS/vector indexing (default true). |
+| `MANTICORE_OBS_HTTP_ENABLED` | Observability HTTP API (default false; on with `--headless`). |
+| `MANTICORE_OBS_HTTP_PORT` | Observability port (default 9463). |
+| `MANTICORE_LOG_JSON` | JSON tracing output. |
 
 Full auth and RBAC semantics are documented in `docs/auth-rbac-model.md`.
 
@@ -81,6 +86,29 @@ RUST_LOG=debug cargo run --release
 |------|---------|
 | `--helper-daemon` | Internal: helper subprocess entry (set by the app, not typical for end users). |
 | `--benchmark` | Headless collection benchmark; prints timings to stdout. |
+| `--headless` | Collectors + SQLite store + hybrid search + observability HTTP (no GUI). |
+| `--healthcheck` | Probe `GET /health` on the observability port (used by Docker). |
+
+### Docker Compose (optional services)
+
+Each service is profile-gated and starts independently. Connectors degrade if a peer is missing.
+
+```bash
+docker compose --profile stack up -d          # sentinel + PeerWeave stub + EVRUS OIDC stub
+docker compose --profile sentinel up -d       # telemetry/search only
+docker compose --profile peerweave --profile evrus up -d
+```
+
+- Sentinel observability UI: `http://127.0.0.1:9463/`
+- Search API: `http://127.0.0.1:9463/api/search?q=nginx&mode=hybrid`
+- PeerWeave GraphQL stand-in: `http://127.0.0.1:3200/`
+- EVRUS OIDC stand-in: `http://127.0.0.1:8790/.well-known/openid-configuration`
+
+Replace the stand-ins with live `peer-weave` / `evrus-v0` processes by pointing `MANTICORE_PEERWEAVE_GRAPHQL_URL` and `MANTICORE_EVRUS_OIDC_URL` at them.
+
+### Hybrid search
+
+Host, process, connector, and log documents land in a SQLite WAL store (FTS5 + 64-d hashed n-gram vectors, fused with reciprocal rank). In the GUI use **Search & Discovery**; from the palette: `search nginx` or `search --mode vector high cpu`.
 
 ---
 
@@ -122,6 +150,10 @@ cargo run
 | `src/core/` | Engine, snapshot, policy, commands, config, errors. |
 | `src/security/` | Audit trail, auth/RBAC gate, privileged helper (UDS). |
 | `src/collectors/` | Data collectors (CPU, memory, disk, network, processes). |
+| `src/store/` | SQLite WAL metrics/documents/logs (FTS5 + embeddings). |
+| `src/search/` | Hybrid FTS / vector / semantic discovery. |
+| `src/telemetry/` | Background collector so the UI thread never blocks on `/proc` or HTTP. |
+| `src/observability/` | Optional HTTP API, Prometheus text, and analysis dashboard. |
 | `src/models/` | Metric structs shared by collectors and UI. |
 | `assets/icons/` | Custom SVG icons embedded at compile time for the operator UI. |
 | `config/profiles/` | Example `*.env` profiles for local vs secure-style runs. |
