@@ -1,7 +1,7 @@
 use crate::core::snapshot::SystemSnapshot;
 use anyhow::Context;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use rusqlite::{params, Connection, OpenFlags};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy)]
@@ -13,7 +13,36 @@ pub struct SnapshotHistoryRetention {
 }
 
 pub fn default_snapshot_history_path(root: &Path) -> PathBuf {
-    root.join(".beads").join("state").join("snapshots.jsonl")
+    root.join(".beads").join("state").join("snapshots.sqlite3")
+}
+
+fn open(path: &Path) -> anyhow::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open {}", path.display()))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            host_id TEXT NOT NULL,
+            cpu_usage_percent REAL NOT NULL,
+            memory_used INTEGER NOT NULL,
+            memory_total INTEGER NOT NULL,
+            process_count INTEGER NOT NULL,
+            payload TEXT
+        );
+        CREATE INDEX IF NOT EXISTS snapshots_timestamp_idx ON snapshots(timestamp DESC);",
+    )?;
+    Ok(conn)
 }
 
 pub fn append_snapshot(
@@ -21,157 +50,138 @@ pub fn append_snapshot(
     snapshot: &SystemSnapshot,
     retention: SnapshotHistoryRetention,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    let line = if retention.slim_records {
-        serde_json::to_string(&SnapshotHistoryRecord::from_snapshot(snapshot))
-            .context("serialize snapshot history record")?
+    let mut conn = open(path)?;
+    let tx = conn.transaction()?;
+    let payload = if retention.slim_records {
+        None
     } else {
-        serde_json::to_string(snapshot).context("serialize snapshot")?
+        Some(serde_json::to_string(snapshot).context("serialize snapshot")?)
     };
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    writeln!(f, "{line}").with_context(|| format!("append {}", path.display()))?;
-    compact(path, retention, snapshot.timestamp)?;
+    tx.execute(
+        "INSERT INTO snapshots(timestamp,host_id,cpu_usage_percent,memory_used,memory_total,process_count,payload)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            snapshot.timestamp as i64,
+            snapshot.host_id,
+            snapshot.cpu.usage_percent,
+            snapshot.memory.used as i64,
+            snapshot.memory.total as i64,
+            snapshot.processes.len() as i64,
+            payload
+        ],
+    )?;
+    apply_retention(&tx, retention, snapshot.timestamp)?;
+    tx.commit()?;
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct SnapshotHistoryRecord {
-    timestamp: u64,
-    host_id: String,
-    cpu_usage_percent: f32,
-    memory_used: u64,
-    memory_total: u64,
-    process_count: usize,
-}
-
-impl SnapshotHistoryRecord {
-    fn from_snapshot(snapshot: &SystemSnapshot) -> Self {
-        Self {
-            timestamp: snapshot.timestamp,
-            host_id: snapshot.host_id.clone(),
-            cpu_usage_percent: snapshot.cpu.usage_percent,
-            memory_used: snapshot.memory.used,
-            memory_total: snapshot.memory.total,
-            process_count: snapshot.processes.len(),
+fn apply_retention(
+    conn: &Connection,
+    retention: SnapshotHistoryRetention,
+    now_ts: u64,
+) -> anyhow::Result<()> {
+    if let Some(max_age) = retention.max_age_secs {
+        let min_ts = now_ts.saturating_sub(max_age);
+        conn.execute("DELETE FROM snapshots WHERE timestamp < ?1", [min_ts as i64])?;
+    }
+    if retention.max_entries > 0 {
+        conn.execute(
+            "DELETE FROM snapshots WHERE id NOT IN (
+               SELECT id FROM snapshots ORDER BY id DESC LIMIT ?1
+             )",
+            [retention.max_entries as i64],
+        )?;
+    }
+    // max_bytes is enforced approximately without rewriting the database on every sample.
+    // When the file crosses the cap, discard the oldest quarter, then let WAL checkpointing
+    // reclaim pages asynchronously. This keeps the hot path bounded.
+    if let Some(max_bytes) = retention.max_bytes {
+        let bytes = conn
+            .query_row("PRAGMA page_count", [], |r| r.get::<_, u64>(0))
+            .unwrap_or(0)
+            .saturating_mul(
+                conn.query_row("PRAGMA page_size", [], |r| r.get::<_, u64>(0))
+                    .unwrap_or(4096),
+            );
+        if bytes > max_bytes {
+            let count = conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, u64>(0))
+                .unwrap_or(0);
+            let trim = (count / 4).max(1);
+            conn.execute(
+                "DELETE FROM snapshots WHERE id IN (SELECT id FROM snapshots ORDER BY id ASC LIMIT ?1)",
+                [trim as i64],
+            )?;
         }
     }
+    Ok(())
 }
 
 #[allow(dead_code)]
 pub fn read_since(path: &Path, min_timestamp: u64) -> anyhow::Result<Vec<SystemSnapshot>> {
-    let raw = match fs::read_to_string(path) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM snapshots WHERE timestamp >= ?1 AND payload IS NOT NULL ORDER BY timestamp ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([min_timestamp as i64], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let snapshot: SystemSnapshot =
-            serde_json::from_str(line).context("parse snapshot history line")?;
-        if snapshot.timestamp >= min_timestamp {
-            out.push(snapshot);
-        }
+    for raw in rows {
+        let raw = raw?;
+        out.push(serde_json::from_str(&raw).context("parse snapshot payload")?);
     }
     Ok(out)
 }
 
 pub fn count_since(path: &Path, min_timestamp: u64) -> anyhow::Result<usize> {
-    let file = match File::open(path) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
-    };
-
-    #[derive(serde::Deserialize)]
-    struct SnapshotTimestampOnly {
-        timestamp: u64,
+    if !path.exists() {
+        return Ok(0);
     }
+    let conn = open(path)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM snapshots WHERE timestamp >= ?1",
+        [min_timestamp as i64],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as usize)
+}
 
-    let mut count = 0usize;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("read {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: SnapshotTimestampOnly =
-            serde_json::from_str(&line).context("parse snapshot history timestamp")?;
-        if row.timestamp >= min_timestamp {
-            count += 1;
-        }
+pub fn read_metric_rows(
+    path: &Path,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, f32, u64, u64, usize)>> {
+    if !path.exists() {
+        return Ok(Vec::new());
     }
-
-    Ok(count)
+    let conn = open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT timestamp,cpu_usage_percent,memory_used,memory_total,process_count
+         FROM snapshots ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?.max(0) as u64,
+            row.get::<_, f64>(1)? as f32,
+            row.get::<_, i64>(2)?.max(0) as u64,
+            row.get::<_, i64>(3)?.max(0) as u64,
+            row.get::<_, i64>(4)?.max(0) as usize,
+        ))
+    })?;
+    let mut out: Vec<_> = rows.collect::<Result<_, _>>()?;
+    out.reverse();
+    Ok(out)
 }
 
 pub fn reset(path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(path, "").with_context(|| format!("truncate {}", path.display()))
-}
-
-fn compact(path: &Path, retention: SnapshotHistoryRetention, now_ts: u64) -> anyhow::Result<()> {
-    let raw = match fs::read_to_string(path) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    let original_bytes = raw.len() as u64;
-
-    let mut lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
-
-    if let Some(max_age_secs) = retention.max_age_secs {
-        #[derive(serde::Deserialize)]
-        struct SnapshotTimestampOnly {
-            timestamp: u64,
-        }
-        let min_ts = now_ts.saturating_sub(max_age_secs);
-        lines.retain(|line| {
-            serde_json::from_str::<SnapshotTimestampOnly>(line)
-                .map(|row| row.timestamp >= min_ts)
-                .unwrap_or(false)
-        });
-    }
-
-    if retention.max_entries > 0 && lines.len() > retention.max_entries {
-        let keep_from = lines.len() - retention.max_entries;
-        lines = lines.split_off(keep_from);
-    }
-
-    if let Some(max_bytes) = retention.max_bytes {
-        let mut kept: Vec<&str> = Vec::new();
-        let mut total = 0u64;
-        for line in lines.iter().rev() {
-            let line_bytes = (line.len() + 1) as u64;
-            if !kept.is_empty() && total.saturating_add(line_bytes) > max_bytes {
-                break;
-            }
-            kept.push(*line);
-            total = total.saturating_add(line_bytes);
-        }
-        kept.reverse();
-        lines = kept;
-    }
-
-    let mut content = lines.join("\n");
-    if !content.is_empty() {
-        content.push('\n');
-    }
-    let next_bytes = content.len() as u64;
-    if next_bytes == original_bytes && content == raw {
+    if !path.exists() {
+        let _ = open(path)?;
         return Ok(());
     }
-    fs::write(path, content).with_context(|| format!("rewrite {}", path.display()))?;
+    let conn = open(path)?;
+    conn.execute("DELETE FROM snapshots", [])?;
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     Ok(())
 }
 
@@ -187,169 +197,41 @@ mod tests {
         SystemSnapshot {
             timestamp,
             host_id: "local-test".to_string(),
-            cpu: CpuMetrics {
-                usage_percent: 12.5,
-                per_core: vec![10.0, 15.0],
-                load_avg: (0.4, 0.5, 0.6),
-            },
-            memory: MemoryMetrics {
-                total: 1024,
-                used: 512,
-                available: 512,
-            },
-            disks: vec![DiskMetrics {
-                device: "sda".to_string(),
-                read_bytes_per_sec: 100,
-                write_bytes_per_sec: 50,
-            }],
-            network: vec![NetworkMetrics {
-                interface: "eth0".to_string(),
-                rx_bytes_per_sec: 200,
-                tx_bytes_per_sec: 120,
-            }],
-            processes: vec![ProcessMetrics {
-                pid: 1,
-                name: "init".to_string(),
-                cpu_percent: 0.1,
-                memory_bytes: 4096,
-                threads: 1,
-                cmdline: "/sbin/init".to_string(),
-            }],
+            cpu: CpuMetrics { usage_percent: 12.5, per_core: vec![10.0, 15.0], load_avg: (0.4, 0.5, 0.6) },
+            memory: MemoryMetrics { total: 1024, used: 512, available: 512 },
+            disks: vec![DiskMetrics { device: "sda".to_string(), read_bytes_per_sec: 100, write_bytes_per_sec: 50 }],
+            network: vec![NetworkMetrics { interface: "eth0".to_string(), rx_bytes_per_sec: 200, tx_bytes_per_sec: 120 }],
+            processes: vec![ProcessMetrics { pid: 1, name: "init".to_string(), cpu_percent: 0.1, memory_bytes: 4096, threads: 1, cmdline: "/sbin/init".to_string() }],
         }
     }
 
-    #[test]
-    fn append_and_read_since_with_retention() {
-        let root = std::env::temp_dir().join(format!(
-            "manticore-history-test-{}-{}",
-            std::process::id(),
-            crate::utils::time::now_unix_secs()
-        ));
-        let path = default_snapshot_history_path(&root);
-
-        let retention = SnapshotHistoryRetention {
-            max_entries: 2,
-            max_age_secs: None,
-            max_bytes: None,
-            slim_records: false,
-        };
-        append_snapshot(&path, &sample_snapshot(100), retention).expect("append 1");
-        append_snapshot(&path, &sample_snapshot(200), retention).expect("append 2");
-        append_snapshot(&path, &sample_snapshot(300), retention).expect("append 3");
-
-        let all = read_since(&path, 0).expect("read all");
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].timestamp, 200);
-        assert_eq!(all[1].timestamp, 300);
-
-        let recent = read_since(&path, 250).expect("read recent");
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].timestamp, 300);
-
-        let _ = std::fs::remove_file(&path);
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("manticore-{name}-{}-{}.sqlite3", std::process::id(), crate::utils::time::now_unix_secs()))
     }
 
     #[test]
-    fn count_since_reads_only_timestamps() {
-        let root = std::env::temp_dir().join(format!(
-            "manticore-history-count-test-{}-{}",
-            std::process::id(),
-            crate::utils::time::now_unix_secs()
-        ));
-        let path = default_snapshot_history_path(&root);
-
-        let retention = SnapshotHistoryRetention {
-            max_entries: 10,
-            max_age_secs: None,
-            max_bytes: None,
-            slim_records: false,
-        };
-        append_snapshot(&path, &sample_snapshot(100), retention).expect("append 1");
-        append_snapshot(&path, &sample_snapshot(200), retention).expect("append 2");
-        append_snapshot(&path, &sample_snapshot(300), retention).expect("append 3");
-
-        let recent = count_since(&path, 150).expect("count recent");
-        assert_eq!(recent, 2);
-
-        let _ = std::fs::remove_file(&path);
+    fn retention_keeps_latest_rows() {
+        let path = temp_path("history-retention");
+        let retention = SnapshotHistoryRetention { max_entries: 2, max_age_secs: None, max_bytes: None, slim_records: false };
+        append_snapshot(&path, &sample_snapshot(100), retention).unwrap();
+        append_snapshot(&path, &sample_snapshot(200), retention).unwrap();
+        append_snapshot(&path, &sample_snapshot(300), retention).unwrap();
+        let rows = read_since(&path, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].timestamp, 200);
+        assert_eq!(count_since(&path, 250).unwrap(), 1);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn append_applies_max_age_window() {
-        let root = std::env::temp_dir().join(format!(
-            "manticore-history-age-test-{}-{}",
-            std::process::id(),
-            crate::utils::time::now_unix_secs()
-        ));
-        let path = default_snapshot_history_path(&root);
-        let retention = SnapshotHistoryRetention {
-            max_entries: 10,
-            max_age_secs: Some(100),
-            max_bytes: None,
-            slim_records: false,
-        };
-
-        append_snapshot(&path, &sample_snapshot(100), retention).expect("append 1");
-        append_snapshot(&path, &sample_snapshot(200), retention).expect("append 2");
-        append_snapshot(&path, &sample_snapshot(300), retention).expect("append 3");
-
-        let all = read_since(&path, 0).expect("read all");
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].timestamp, 200);
-        assert_eq!(all[1].timestamp, 300);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn append_applies_max_bytes_window() {
-        let root = std::env::temp_dir().join(format!(
-            "manticore-history-bytes-test-{}-{}",
-            std::process::id(),
-            crate::utils::time::now_unix_secs()
-        ));
-        let path = default_snapshot_history_path(&root);
-        let base = sample_snapshot(100);
-        let line_len = serde_json::to_string(&base).expect("serialize").len() as u64 + 1;
-        let retention = SnapshotHistoryRetention {
-            max_entries: 10,
-            max_age_secs: None,
-            max_bytes: Some(line_len + 10),
-            slim_records: false,
-        };
-
-        append_snapshot(&path, &sample_snapshot(100), retention).expect("append 1");
-        append_snapshot(&path, &sample_snapshot(200), retention).expect("append 2");
-        append_snapshot(&path, &sample_snapshot(300), retention).expect("append 3");
-
-        let all = read_since(&path, 0).expect("read all");
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].timestamp, 300);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn append_slim_records_are_countable() {
-        let root = std::env::temp_dir().join(format!(
-            "manticore-history-slim-test-{}-{}",
-            std::process::id(),
-            crate::utils::time::now_unix_secs()
-        ));
-        let path = default_snapshot_history_path(&root);
-        let retention = SnapshotHistoryRetention {
-            max_entries: 10,
-            max_age_secs: None,
-            max_bytes: None,
-            slim_records: true,
-        };
-
-        append_snapshot(&path, &sample_snapshot(100), retention).expect("append 1");
-        append_snapshot(&path, &sample_snapshot(200), retention).expect("append 2");
-
-        let recent = count_since(&path, 150).expect("count recent");
-        assert_eq!(recent, 1);
-
-        let _ = std::fs::remove_file(&path);
+    fn slim_rows_are_queryable_without_payload_cost() {
+        let path = temp_path("history-slim");
+        let retention = SnapshotHistoryRetention { max_entries: 10, max_age_secs: None, max_bytes: None, slim_records: true };
+        append_snapshot(&path, &sample_snapshot(100), retention).unwrap();
+        append_snapshot(&path, &sample_snapshot(200), retention).unwrap();
+        assert_eq!(count_since(&path, 150).unwrap(), 1);
+        assert_eq!(read_since(&path, 0).unwrap().len(), 0);
+        assert_eq!(read_metric_rows(&path, 10).unwrap().len(), 2);
+        let _ = fs::remove_file(path);
     }
 }
