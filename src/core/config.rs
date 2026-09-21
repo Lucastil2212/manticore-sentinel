@@ -263,7 +263,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
 fn load_connector_config(auth_mode: &AuthMode) -> ConnectorConfig {
     let peerweave = if parse_bool_env("MANTICORE_PEERWEAVE_ENABLED", false).unwrap_or(false) {
         let graphql_url = std::env::var("MANTICORE_PEERWEAVE_GRAPHQL_URL")
-            .unwrap_or_else(|_| "http://localhost:3200/graphql".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:49152/graphql".to_string());
         let cap_token = std::env::var("MANTICORE_PEERWEAVE_CAP_TOKEN").ok();
         let poll_ms = std::env::var("MANTICORE_PEERWEAVE_POLL_MS")
             .ok()

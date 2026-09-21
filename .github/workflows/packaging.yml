@@ -42,7 +42,11 @@ jobs:
 
       - name: Validate manifest key fields
         run: |
-          rg "^app-id: io\\.manticore\\.Sentinel$" packaging/flatpak/io.manticore.Sentinel.yml
+          grep -Eq '^app-id: io\\.manticore\\.Sentinel
+          grep -Eq '^runtime:' packaging/flatpak/io.manticore.Sentinel.yml
+          grep -Eq '^sdk:' packaging/flatpak/io.manticore.Sentinel.yml
+          grep -Eq '^modules:' packaging/flatpak/io.manticore.Sentinel.yml
+ packaging/flatpak/io.manticore.Sentinel.yml
           rg "^runtime:" packaging/flatpak/io.manticore.Sentinel.yml
           rg "^sdk:" packaging/flatpak/io.manticore.Sentinel.yml
           rg "^modules:" packaging/flatpak/io.manticore.Sentinel.yml

@@ -1,0 +1,86 @@
+name: manticore-stack
+
+services:
+  search:
+    build: ./services/search
+    profiles: ["search"]
+    restart: unless-stopped
+    environment:
+      SENTINEL_SEARCH_DB: /data/search.db
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION: sentinel
+    volumes:
+      - sentinel-search:/data
+    ports:
+      - "127.0.0.1:${SENTINEL_SEARCH_PORT:-8088}:8088"
+    networks: [manticore]
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    profiles: ["vector"]
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    ports:
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+    networks: [manticore]
+
+  peerweave:
+    build:
+      context: ${PEERWEAVE_DIR:-../peer-weave}
+      dockerfile: docker/Dockerfile.cli
+    profiles: ["peerweave"]
+    restart: unless-stopped
+    environment:
+      PW_HOME: /home/peerweave/.peerweave
+      PW_LISTEN: /ip4/0.0.0.0/udp/4001/quic-v1
+      PW_MDNS: "on"
+      PW_GATEWAY_BIND: 0.0.0.0:8788
+    volumes:
+      - peerweave-home:/home/peerweave/.peerweave
+    ports:
+      - "4001:4001/udp"
+      - "127.0.0.1:8788:8788"
+    networks: [manticore]
+
+  evrmore-node:
+    build:
+      context: ${EVRUS_DIR:-../evrus-v0}/docker/evrmore-node
+      dockerfile: Dockerfile
+      args:
+        EVRMORE_RELEASE_URL: https://github.com/EvrmoreOrg/Evrmore/releases/download/v2.0.0test/evrmore-2.0.0test1-88fc8c74c-x86_64-linux-gnu.tar.gz
+    profiles: ["evrus"]
+    restart: unless-stopped
+    command: >-
+      evrmored -server=1 -testnet=1 -txindex=1 -addressindex=1 -assetindex=1
+      -rpcport=18819 -port=18820
+      -rpcuser=${EVR_RPC_USER:-evruser} -rpcpassword=${EVR_RPC_PASS:-evrpass}
+      -rpcbind=0.0.0.0 -rpcallowip=0.0.0.0/0
+    volumes:
+      - evrmore-data:/root/.evrmore
+    ports:
+      - "127.0.0.1:18819:18819"
+    networks: [manticore]
+
+  evrus-oidc:
+    build:
+      context: ${EVRUS_DIR:-../evrus-v0}/apps/oidc-bridge
+    profiles: ["evrus"]
+    restart: unless-stopped
+    environment:
+      EVRUS_SIOP_ISS: ${EVRUS_SIOP_ISS:-did:key:z6MkDemo}
+      TOKEN_TTL_SECONDS: ${EVRUS_TOKEN_TTL_SECONDS:-300}
+      PORT: 8790
+    ports:
+      - "127.0.0.1:8790:8790"
+    networks: [manticore]
+
+networks:
+  manticore:
+    driver: bridge
+
+volumes:
+  sentinel-search:
+  qdrant-data:
+  peerweave-home:
+  evrmore-data:

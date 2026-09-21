@@ -14,7 +14,7 @@ use crate::core::{
     config::load_runtime_config,
     engine::SentinelEngine,
     history::{
-        append_snapshot, count_since, default_snapshot_history_path,
+        append_snapshot, count_since, default_snapshot_history_path, read_metric_rows,
         reset as reset_snapshot_history, SnapshotHistoryRetention,
     },
     policy::{AlertMatch, AlertSeverity, ExecutionPolicy},
@@ -203,95 +203,25 @@ enum ProcessSort {
 
 impl SentinelDashboard {
     fn hydrate_metric_history_from_disk(&mut self) {
-        let raw = match std::fs::read_to_string(&self.snapshot_history_path) {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(rows) = read_metric_rows(&self.snapshot_history_path, METRIC_HISTORY_CAP) else {
+            return;
         };
-        for line in raw.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let ts = row.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-            if ts == 0 {
-                continue;
-            }
-            let cpu_pct = row
-                .get("cpu")
-                .and_then(|v| v.get("usage_percent"))
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .or_else(|| {
-                    row.get("cpu_usage_percent")
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32)
-                })
-                .unwrap_or(0.0);
-            let memory_used = row
-                .get("memory")
-                .and_then(|v| v.get("used"))
-                .and_then(|v| v.as_u64())
-                .or_else(|| row.get("memory_used").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
-            let memory_total = row
-                .get("memory")
-                .and_then(|v| v.get("total"))
-                .and_then(|v| v.as_u64())
-                .or_else(|| row.get("memory_total").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
+        for (ts, cpu_pct, memory_used, memory_total, process_count) in rows {
             let mem_pct = if memory_total == 0 {
                 0.0
             } else {
                 (memory_used as f32 / memory_total as f32) * 100.0
             };
-            let disk_bps = row
-                .get("disks")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().fold(0.0, |acc, disk| {
-                        let r = disk
-                            .get("read_bytes_per_sec")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let w = disk
-                            .get("write_bytes_per_sec")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        acc + r.saturating_add(w) as f64
-                    })
-                })
-                .unwrap_or(0.0);
-            let net_bps = row
-                .get("network")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().fold(0.0, |acc, net| {
-                        let rx = net.get("rx_bytes_per_sec").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let tx = net.get("tx_bytes_per_sec").and_then(|v| v.as_u64()).unwrap_or(0);
-                        acc + rx.saturating_add(tx) as f64
-                    })
-                })
-                .unwrap_or(0.0);
-            let process_count = row
-                .get("processes")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.len())
-                .or_else(|| {
-                    row.get("process_count")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                })
-                .unwrap_or(0);
             push_history(
                 &mut self.metric_history,
                 MetricSample {
                     ts,
                     cpu_pct,
                     mem_pct,
-                    disk_bps,
-                    net_bps,
+                    // Slim durable rows intentionally keep the high-frequency storage footprint small.
+                    // Disk/network charts are populated from the live collector after startup.
+                    disk_bps: 0.0,
+                    net_bps: 0.0,
                     process_count,
                 },
                 METRIC_HISTORY_CAP,
@@ -2603,62 +2533,27 @@ impl SentinelDashboard {
                 .show(ui, |ui| {
                     if let Some(snapshot) = self.connector_summary.snapshot_for("PeerWeave") {
                         let payload = snapshot.data.get("data").unwrap_or(&snapshot.data);
-                        let node = payload.get("node").cloned().unwrap_or_default();
-                        let graph = payload.get("graph").cloned().unwrap_or_default();
+                        let stats = payload.get("stats").cloned().unwrap_or_default();
+                        let graph_nodes = stats.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let graph_edges = stats.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0);
                         ui.label(
                             RichText::new(format!(
-                                "Node: {}  |  Status: {}  |  Uptime: {}s",
-                                node.get("peerId")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                node.get("status")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                node.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0)
+                                "Graph nodes: {}  |  Graph edges: {}",
+                                graph_nodes, graph_edges
                             ))
                             .strong(),
                         );
-                        ui.label(format!(
-                            "Peers: {}  |  Graph nodes: {}  |  Graph edges: {}",
-                            node.get("peers")
-                                .and_then(|p| p.get("count"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0),
-                            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0)
-                        ));
-                        let peers = node
-                            .get("peers")
-                            .and_then(|p| p.get("count"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let graph_nodes =
-                            graph.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let graph_edges =
-                            graph.get("edgeCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                        render_topology_map(ui, peers, graph_nodes, graph_edges);
-                        if let Some(spaces) = payload.get("spaces").and_then(|v| v.as_array()) {
-                            ui.label(RichText::new("Spaces").strong());
-                            if spaces.is_empty() {
-                                ui.label("No spaces returned.");
-                            } else {
-                                for space in spaces.iter().take(16) {
-                                    let name = space
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unnamed");
-                                    let sync = space
-                                        .get("syncState")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
-                                    let ops =
-                                        space.get("opsCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    ui.label(format!("{name} · sync={sync} · ops={ops}"));
-                                }
+                        render_topology_map(ui, 0, graph_nodes, graph_edges);
+                        if let Some(nodes) = payload.get("allNodes").and_then(|v| v.as_array()) {
+                            ui.label(RichText::new("Recent graph sample").strong());
+                            for node in nodes.iter().take(8) {
+                                let label = node.get("label").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                                let kind = node.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                ui.label(format!("{label} · {kind}"));
                             }
                         }
                     } else {
-                        ui.label("Waiting for PeerWeave snapshot data...");
+                        ui.label("Waiting for PeerWeave GraphQL data...");
                     }
                 });
         }
