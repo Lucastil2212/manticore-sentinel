@@ -9,7 +9,7 @@ rm -rf "${APPDIR}"
 mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/share/applications" "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
 
 pushd "${ROOT_DIR}" >/dev/null
-cargo build --release
+cargo build --release --locked
 popd >/dev/null
 
 cp "${ROOT_DIR}/target/release/${BIN_NAME}" "${APPDIR}/usr/bin/${BIN_NAME}"
