@@ -84,6 +84,27 @@ RUST_LOG=debug cargo run --release
 
 ---
 
+## Realtime search and ecosystem stack
+
+Sentinel now includes an optional Compose stack for local FTS/hybrid discovery, vector indexing, PeerWeave, and EVRUS infrastructure. Services are isolated behind Compose profiles so they can be started independently and fail independently.
+
+```bash
+# Fast local full-text search
+
+docker compose --profile search up -d --build
+
+# Hybrid FTS + vector retrieval
+
+docker compose --profile search --profile vector up -d --build
+
+# Full optional ecosystem (sibling repos expected beside this checkout)
+PEERWEAVE_DIR=../peer-weave EVRUS_DIR=../evrus-v0 \\
+docker compose --profile search --profile vector --profile peerweave --profile evrus up -d --build
+```
+
+See `docs/realtime-search-stack.md` for the data path, search API, performance rules, and current PeerWeave GraphQL contract.
+
+
 ## For developers
 
 ### Prerequisites
